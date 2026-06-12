@@ -14,7 +14,7 @@ korek is malay language which is stands for "Dig".
   gcc -o copyfail copyfail.c -static -lz
   ```
 
-#### 3 - korek.ps1
+#### 3 - win-korek.ps1
 - after running winpeas.exe, if you dont find anything, can continue with this
 
 #### 4 - linux-korek.sh
