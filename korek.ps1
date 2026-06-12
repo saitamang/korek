@@ -3,7 +3,7 @@
 # Covers what winPEAS misses - run AFTER winPEAS
 # =============================================================================
 # Usage:
-#   . .\Invoke-Korek.ps1; Invoke-Korek
+#   . .\korek.ps1; Invoke-Korek
 #   Invoke-Korek -OutputFile C:\Windows\Tasks\recon.txt
 # =============================================================================
 
