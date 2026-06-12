@@ -5,4 +5,6 @@ Be mindful, those copyfail only tested on kali
 ```
 # copyfail.c can be compile:
 gcc -o copyfail copyfail.c -lz
+or
+gcc -o copyfail copyfail.c -static -lz
 ```
