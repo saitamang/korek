@@ -1,5 +1,5 @@
 # korek
-korek is malay language which is stands for "Dig". We utilize this to dig everything and this repo prep people for OSCP.
+korek is malay language which is stands for "Dig".
 
 ## Tools:
 ### I build severel tools here to cover on enumeration and priv es part:
