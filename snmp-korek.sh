@@ -137,20 +137,30 @@ echo -e "${C}================================================${N}"
 # =============================================================================
 # Test connectivity - try v2c first then v1
 # =============================================================================
-test_result=$(snmpwalk -v2c -c $COMM -Oqv "$IP" .1.3.6.1.2.1.1.1.0 2>/dev/null | head -1)
+# =============================================================================
+# Test connectivity - try v2c first then v1
+# =============================================================================
+test_result=$(snmpwalk -v2c -c "$COMM" -Oqv "$IP" .1.3.6.1.2.1.1.1.0 2>/dev/null | head -1)
 if [[ -n "$test_result" ]]; then
     VER="2c"
     hit "Connected! SNMP v2c community '$COMM'"
 else
-    test_result=$(snmpwalk -v1 -c $COMM -Oqv "$IP" .1.3.6.1.2.1.1.1.0 2>/dev/null | head -1)
+    test_result=$(snmpwalk -v1 -c "$COMM" -Oqv "$IP" .1.3.6.1.2.1.1.1.0 2>/dev/null | head -1)
     if [[ -n "$test_result" ]]; then
         VER="1"
         hit "Connected! SNMP v1 community '$COMM'"
     else
-        echo "[-] Cannot connect with community '$COMM'"
-        echo "[-] Try: onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt $IP"
-        echo "[-] Or:  $0 $IP private"
-        exit 1
+        # last resort - try without -Oqv flag
+        test_result=$(snmpwalk -v2c -c "$COMM" "$IP" .1.3.6.1.2.1.1.1.0 2>/dev/null | head -1)
+        if [[ -n "$test_result" ]]; then
+            VER="2c"
+            hit "Connected! SNMP v2c community '$COMM'"
+        else
+            echo "[-] Cannot connect with community '$COMM'"
+            echo "[-] Try: onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt $IP"
+            echo "[-] Or:  $0 $IP private"
+            exit 1
+        fi
     fi
 fi
 
