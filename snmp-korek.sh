@@ -133,11 +133,15 @@ echo -e "${C}  snmp-korek.sh - SNMP Recon (Exam Focused)${N}"
 echo -e "${C}  Target: $IP | Community: $COMM${N}"
 echo -e "${C}================================================${N}"
 
-# test connectivity
-if ! snmpget -v$VER -c $COMM "$IP" sysDescr.0 >/dev/null 2>&1; then
+# test connectivity - use snmpwalk (more reliable than snmpget)
+test_result=$(snmpwalk -v$VER -c $COMM -Oqv "$IP" sysDescr 2>/dev/null | head -1)
+if [[ -z "$test_result" ]]; then
     VER="1"
-    if ! snmpget -v$VER -c $COMM "$IP" sysDescr.0 >/dev/null 2>&1; then
-        echo "[-] Cannot connect - try: onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt $IP"
+    test_result=$(snmpwalk -v$VER -c $COMM -Oqv "$IP" sysDescr 2>/dev/null | head -1)
+    if [[ -z "$test_result" ]]; then
+        echo "[-] Cannot connect with community '$COMM'"
+        echo "[-] Try: onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt $IP"
+        echo "[-] Or:  $0 $IP private"
         exit 1
     fi
 fi
