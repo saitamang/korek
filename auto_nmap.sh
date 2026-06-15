@@ -83,11 +83,10 @@ for arg in "$@"; do
 done
 
 # Build nmap speed flags
-# FIX: --defeat-rst-ratelimit is critical for high-latency/filtered hosts
 if [[ "$TIMING" == "T4" ]]; then
-    SPEED="-T4 --min-rate 3000 --defeat-rst-ratelimit"
+    SPEED="-T4 --min-rate 3000"
 else
-    SPEED="-T2 --min-rate 1000 --defeat-rst-ratelimit"
+    SPEED="-T2 --min-rate 1000"
 fi
 
 # =============================================================================
@@ -243,33 +242,43 @@ do_tcp_scan() {
 
     log "TCP Stage 1/2: Full port scan..."
 
-    # FIX: added --defeat-rst-ratelimit via $SPEED to catch ports on slow/filtered hosts
-    if ! nmap -Pn $SPEED -p- "$ip" \
-        --open \
-        -oN "$outdir/${ip}_tcp_ports.txt" 2>/dev/null; then
-        err "TCP port scan failed for $ip — check connectivity"
-        return 1
+    # NOTE: --open is intentionally NOT used in stage 1
+    # On high-latency/filtered hosts (e.g. 172.16.x.x pivots), --open causes
+    # nmap to report nothing because filtered ports get silently dropped.
+    # We grep for "open" ourselves from the full output instead.
+    # --defeat-rst-ratelimit is critical for slow/filtered hosts to prevent
+    # nmap from giving up on ports that don't immediately RST back.
+    nmap -Pn $SPEED -p- "$ip" \
+        --defeat-rst-ratelimit \
+        -oN "$outdir/${ip}_tcp_ports.txt" 2>&1 | tee /tmp/nmap_stage1.txt
+
+    # Show any nmap warnings to help debug
+    if grep -qi "warning\|error\|failed\|0 hosts" /tmp/nmap_stage1.txt; then
+        warn "nmap reported issues — check output above"
     fi
 
-    # Extract open ports
+    # Extract open ports (exclude filtered/closed)
     ports=$(grep "^[0-9]" "$outdir/${ip}_tcp_ports.txt" 2>/dev/null | \
+            grep "/tcp" | \
             grep "open" | \
+            grep -v "filtered\|closed" | \
             awk '{split($1,a,"/"); printf "%s,",a[1]}' | \
             sed 's/,$//')
 
     if [[ -z "$ports" ]]; then
-        warn "No open TCP ports on $ip"
-        warn "Try: $0 $ip --udp  OR  $0 $ip T4  OR check if host is up"
+        warn "No open TCP ports found on $ip"
+        warn "Possible reasons:"
+        warn "  1. Host behind firewall — try T4: $0 $ip T4"
+        warn "  2. Need pivot/tunnel to reach this subnet"
+        warn "  3. Check connectivity: ping $ip / nc -zv $ip 445"
         return 0
     fi
 
     good "Open TCP ports: $ports"
 
     log "TCP Stage 2/2: Service scan on open ports..."
-    if ! nmap -Pn $SPEED -sC -sV -p "$ports" "$ip" \
-        -oA "$outdir/${ip}_tcp" 2>/dev/null; then
-        warn "Service scan failed — port list may be stale, retry"
-    fi
+    nmap -Pn $SPEED -sC -sV -p "$ports" "$ip" \
+        -oA "$outdir/${ip}_tcp" 2>&1
 
     service_hints "$ip" "$outdir/${ip}_tcp_ports.txt" "tcp"
 
@@ -292,8 +301,7 @@ do_udp_scan() {
     log "UDP Stage 1/2: Top-100 port scan (requires sudo)..."
 
     if ! nmap -Pn $SPEED -sU --top-ports 100 "$ip" \
-        --open \
-        -oN "$outdir/${ip}_udp_ports.txt" 2>/dev/null; then
+        -oN "$outdir/${ip}_udp_ports.txt" 2>&1 | tee /tmp/nmap_udp.txt; then
         err "UDP scan failed for $ip"
         return 1
     fi
@@ -388,24 +396,83 @@ scan_host() {
         echo "Date: $(date)"
         echo "Mode: $SCAN_MODE | Timing: $TIMING"
         echo ""
-        if [[ -f "$outdir/${ip}_tcp_ports.txt" ]]; then
-            echo "## TCP Ports"
-            echo '```'
-            grep "^[0-9]" "$outdir/${ip}_tcp_ports.txt" 2>/dev/null | grep "open" || echo "none"
-            echo '```'
-        fi
-        if [[ -f "$outdir/${ip}_udp_ports.txt" ]]; then
-            echo ""
-            echo "## UDP Ports"
-            echo '```'
-            grep "^[0-9]" "$outdir/${ip}_udp_ports.txt" 2>/dev/null | grep "open" || echo "none"
-            echo '```'
-        fi
-        if [[ -f "$outdir/results.txt" ]]; then
-            echo ""
-            echo "## Results"
+
+        # Quick reference port list
+        if [[ -f "$outdir/results.txt" ]] && [[ -s "$outdir/results.txt" ]]; then
+            echo "## Open Ports (Quick Reference)"
+            echo ```
             cat "$outdir/results.txt"
+            echo ```
+            echo ""
         fi
+
+        # TCP port table
+        if [[ -f "$outdir/${ip}_tcp_ports.txt" ]]; then
+            echo "## TCP Port Scan"
+            echo ```
+            grep "^[0-9]" "$outdir/${ip}_tcp_ports.txt" 2>/dev/null | grep "open" | grep -v "filtered\|closed" || echo "none"
+            echo ```
+            echo ""
+        fi
+
+        # Full TCP service scan output
+        if [[ -f "$outdir/${ip}_tcp.nmap" ]]; then
+            echo "## TCP Service Scan (nmap -sC -sV)"
+            echo ```
+            cat "$outdir/${ip}_tcp.nmap"
+            echo ```
+            echo ""
+        fi
+
+        # UDP port table
+        if [[ -f "$outdir/${ip}_udp_ports.txt" ]]; then
+            echo "## UDP Port Scan"
+            echo ```
+            grep "^[0-9]" "$outdir/${ip}_udp_ports.txt" 2>/dev/null | grep "open" || echo "none"
+            echo ```
+            echo ""
+        fi
+
+        # Full UDP service scan output
+        if [[ -f "$outdir/${ip}_udp.nmap" ]]; then
+            echo "## UDP Service Scan"
+            echo ```
+            cat "$outdir/${ip}_udp.nmap"
+            echo ```
+            echo ""
+        fi
+
+        # Next steps based on open ports
+        echo "## Next Steps"
+        echo ```
+        if [[ -f "$outdir/${ip}_tcp_ports.txt" ]]; then
+            while IFS= read -r line; do
+                port=$(echo "$line" | awk '{print $1}' | cut -d'/' -f1)
+                case "$port" in
+                    21)        echo "FTP($port)      → ftp $ip | lftp -u anonymous, ftp://$ip" ;;
+                    22)        echo "SSH($port)      → ssh user@$ip | hydra -l user -P rockyou.txt ssh://$ip" ;;
+                    25|587)    echo "SMTP($port)     → smtp-user-enum -M VRFY -U users.txt -t $ip" ;;
+                    53)        echo "DNS($port)      → dig axfr DOMAIN @$ip | dnsrecon -d DOMAIN -t axfr -n $ip" ;;
+                    80|8080|8000|8888) echo "HTTP($port)     → feroxbuster -u http://$ip:$port -w raft-medium-directories.txt | nikto -h http://$ip:$port" ;;
+                    88)        echo "Kerberos($port) → impacket-GetNPUsers DOMAIN/ -usersfile users.txt -no-pass -dc-ip $ip" ;;
+                    110)       echo "POP3($port)     → telnet $ip 110" ;;
+                    111)       echo "RPC($port)      → rpcinfo -p $ip | showmount -e $ip" ;;
+                    139|445)   echo "SMB($port)      → nxc smb $ip -u \'\' -p \'\' --shares | enum4linux-ng $ip | smbclient -L //$ip/" ;;
+                    389|636|3268) echo "LDAP($port)  → ldapsearch -x -H ldap://$ip -b DC=domain,DC=com | nxc ldap $ip -u \'\' -p \'\' --users" ;;
+                    443|8443)  echo "HTTPS($port)    → feroxbuster -u https://$ip:$port -k -w raft-medium-directories.txt | nikto -h https://$ip:$port -ssl" ;;
+                    1433)      echo "MSSQL($port)    → nxc mssql $ip -u sa -p \'\' | impacket-mssqlclient sa@$ip" ;;
+                    2049)      echo "NFS($port)      → showmount -e $ip | mount -t nfs $ip:/ /mnt/" ;;
+                    3306)      echo "MySQL($port)    → mysql -u root -h $ip | nxc mysql $ip -u root -p \'\'" ;;
+                    3389)      echo "RDP($port)      → xfreerdp /u:administrator /p:password /v:$ip | nxc rdp $ip -u users.txt -p passwords.txt" ;;
+                    5432)      echo "Postgres($port) → psql -h $ip -U postgres | nxc postgres $ip -u postgres -p \'\'" ;;
+                    5985|5986|47001) echo "WinRM($port)→ evil-winrm -i $ip -u administrator -p password | nxc winrm $ip -u user -p pass" ;;
+                    6379)      echo "Redis($port)    → redis-cli -h $ip | redis-cli -h $ip KEYS \'*\'" ;;
+                    27017)     echo "MongoDB($port)  → mongosh $ip" ;;
+                esac
+            done < <(grep "^[0-9]" "$outdir/${ip}_tcp_ports.txt" 2>/dev/null | grep "open" | grep -v "filtered\|closed")
+        fi
+        echo ```
+
     } > "$outdir/SUMMARY.md" 2>/dev/null
 
     good "Saved: $outdir/SUMMARY.md"
