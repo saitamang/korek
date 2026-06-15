@@ -377,17 +377,49 @@ scan_host() {
             ;;
     esac
 
-    # Final summary
+    # Final summary printed to terminal
     echo ""
     echo -e "${C}============================================${N}"
     good "SCAN COMPLETE: $ip"
+    echo -e "${C}--------------------------------------------${N}"
+
+    # Print open ports
     if [[ -f "$outdir/results.txt" ]] && [[ -s "$outdir/results.txt" ]]; then
         while IFS= read -r line; do
             good "$line"
         done < "$outdir/results.txt"
     else
-        warn "No results recorded for $ip"
+        warn "No open ports recorded for $ip"
     fi
+
+    # Print next steps recap on terminal
+    echo -e "${C}--------------------------------------------${N}"
+    echo -e "${C}  Next Steps:${N}"
+    if [[ -f "$outdir/${ip}_tcp_ports.txt" ]]; then
+        while IFS= read -r line; do
+            port=$(echo "$line" | awk '{print $1}' | cut -d'/' -f1)
+            case "$port" in
+                21)        echo -e "  ${Y}[FTP]${N}      ftp $ip" ;;
+                22)        echo -e "  ${Y}[SSH]${N}      ssh user@$ip" ;;
+                53)        echo -e "  ${Y}[DNS]${N}      dig axfr DOMAIN @$ip" ;;
+                80|8080|8000|8888) echo -e "  ${Y}[HTTP]${N}     feroxbuster -u http://$ip:$port -w raft-medium-directories.txt" ;;
+                88)        echo -e "  ${Y}[KRB]${N}      impacket-GetNPUsers DOMAIN/ -usersfile users.txt -no-pass -dc-ip $ip" ;;
+                111)       echo -e "  ${Y}[NFS]${N}      showmount -e $ip" ;;
+                139|445)   echo -e "  ${Y}[SMB]${N}      nxc smb $ip -u \'\' -p \'\' --shares" ;;
+                389|636|3268) echo -e "  ${Y}[LDAP]${N}     nxc ldap $ip -u \'\' -p \'\' --users" ;;
+                443|8443)  echo -e "  ${Y}[HTTPS]${N}    feroxbuster -u https://$ip:$port -k -w raft-medium-directories.txt" ;;
+                1433)      echo -e "  ${Y}[MSSQL]${N}    nxc mssql $ip -u sa -p \'\'" ;;
+                2049)      echo -e "  ${Y}[NFS]${N}      showmount -e $ip" ;;
+                3306)      echo -e "  ${Y}[MySQL]${N}    mysql -u root -h $ip" ;;
+                3389)      echo -e "  ${Y}[RDP]${N}      xfreerdp /u:administrator /p:password /v:$ip" ;;
+                5432)      echo -e "  ${Y}[PgSQL]${N}    psql -h $ip -U postgres" ;;
+                5985|5986|47001) echo -e "  ${Y}[WinRM]${N}   evil-winrm -i $ip -u administrator -p password" ;;
+                6379)      echo -e "  ${Y}[Redis]${N}    redis-cli -h $ip" ;;
+                27017)     echo -e "  ${Y}[Mongo]${N}    mongosh $ip" ;;
+            esac
+        done < <(grep "^[0-9]" "$outdir/${ip}_tcp_ports.txt" 2>/dev/null | grep "open" | grep -v "filtered\|closed")
+    fi
+
     echo -e "${C}============================================${N}"
 
     # Save SUMMARY.md
