@@ -1,44 +1,22 @@
 #!/usr/bin/env bash
 # =============================================================================
-# auto_nmap.sh - Automated Nmap Scanner + Enumeration Hint Engine
-# Author: korek  (upgraded)
+# auto_nmap.sh - Automated Nmap Scanner
+# Author: korek
 # =============================================================================
 # Usage:
-#   ./auto_nmap.sh <ip>              # TCP only (default)
-#   ./auto_nmap.sh <ip> --udp        # UDP only (when stuck on TCP)
-#   ./auto_nmap.sh <ip> --all        # TCP + UDP
-#   ./auto_nmap.sh -f ip.txt         # from file, TCP only
-#   ./auto_nmap.sh -f ip.txt --all   # from file, TCP + UDP
-#   Add T4 anywhere for fast timing (labs only)
+#   ./auto_nmap.sh <ip>               # TCP only (default)
+#   ./auto_nmap.sh <ip> --udp         # UDP only
+#   ./auto_nmap.sh <ip> --all         # TCP + UDP
+#   ./auto_nmap.sh -f ip.txt          # from file, TCP only
+#   ./auto_nmap.sh -f ip.txt --all    # from file, TCP + UDP
+#   Add T4 anywhere for fast timing
 # =============================================================================
 
-print_help() {
-    cat <<EOF
+set -euo pipefail
 
-Usage:
-  $0 <ip> [--udp|--all] [T4]
-  $0 -f ip.txt [--udp|--all] [T4]
-
-Modes:
-  (default)  TCP only - fast, use first
-  --udp      UDP only  - use when TCP gives nothing
-  --all      TCP + UDP - thorough scan
-
-Options:
-  T4         Fast timing (labs only)
-
-Examples:
-  $0 192.168.1.10
-  $0 192.168.1.10 T4
-  $0 192.168.1.10 --udp
-  $0 192.168.1.10 --all T4
-  $0 -f ip.txt --all T4
-
-EOF
-    exit 1
-}
-
-# Colors
+# =============================================================================
+# COLORS & OUTPUT
+# =============================================================================
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'
 C='\033[0;36m'; W='\033[1;37m'; N='\033[0m'
 
@@ -46,34 +24,46 @@ log()  { echo -e "${C}[*]${N} $1"; }
 good() { echo -e "${G}[+]${N} $1"; }
 warn() { echo -e "${Y}[!]${N} $1"; }
 hot()  { echo -e "${R}[!!]${N} $1"; }
-
-# A short curl that never hangs the whole scan on a dead host
-CURL="curl -sk --max-time 8"
+err()  { echo -e "${R}[ERROR]${N} $1" >&2; }
 
 # =============================================================================
-# Dependency check (warn, don't die — script still useful with partial tools)
+# HELP
 # =============================================================================
-check_deps() {
-    local missing=""
-    for bin in nmap curl awk sed grep; do
-        command -v "$bin" >/dev/null 2>&1 || missing="$missing $bin"
-    done
-    command -v parallel >/dev/null 2>&1 || warn "GNU parallel not found — file mode (-f) will be slower/serial"
-    if [[ -n "$missing" ]]; then
-        warn "Missing tools:$missing  (some features degraded)"
-    fi
+print_help() {
+    echo ""
+    echo -e "${C}Usage:${N}"
+    echo "  $0 <ip> [--udp|--all] [T4]"
+    echo "  $0 -f ip.txt [--udp|--all] [T4]"
+    echo ""
+    echo -e "${C}Modes:${N}"
+    echo "  (default)  TCP only  — use first"
+    echo "  --udp      UDP only  — use when TCP gives nothing"
+    echo "  --all      TCP + UDP — thorough scan"
+    echo ""
+    echo -e "${C}Options:${N}"
+    echo "  T4         Fast timing (labs/exams only)"
+    echo "  -f file    Scan multiple IPs from file"
+    echo ""
+    echo -e "${C}Examples:${N}"
+    echo "  $0 192.168.1.10"
+    echo "  $0 192.168.1.10 T4"
+    echo "  $0 192.168.1.10 --udp"
+    echo "  $0 192.168.1.10 --all T4"
+    echo "  $0 -f targets.txt --all T4"
+    echo ""
+    exit 0
 }
 
 # =============================================================================
-# Arg parsing
+# ARG PARSING
 # =============================================================================
-if [[ -z "$1" ]]; then print_help; fi
+if [[ $# -eq 0 ]]; then print_help; fi
 
 MODE="single"
 FILE=""
 IP=""
-TIMING=""
-SCAN_MODE="tcp"  # tcp | udp | all
+TIMING="normal"
+SCAN_MODE="tcp"
 
 for arg in "$@"; do
     case "$arg" in
@@ -85,288 +75,159 @@ for arg in "$@"; do
         *)
             if [[ "$MODE" == "file" && -z "$FILE" ]]; then
                 FILE="$arg"
-            elif [[ "$MODE" == "single" && -z "$IP" && "$arg" != "-f" ]]; then
+            elif [[ -z "$IP" && "$arg" != "-f" ]]; then
                 IP="$arg"
             fi
             ;;
     esac
 done
 
+# Build nmap speed flags
+# FIX: --defeat-rst-ratelimit is critical for high-latency/filtered hosts
 if [[ "$TIMING" == "T4" ]]; then
-    SPEED="-T4 --min-rate 3000"
+    SPEED="-T4 --min-rate 3000 --defeat-rst-ratelimit"
 else
-    SPEED="--min-rate 1000"
+    SPEED="-T2 --min-rate 1000 --defeat-rst-ratelimit"
 fi
 
 # =============================================================================
-# Priority leads logger — high-value findings get echoed AND appended to a
-# per-host LEADS file so they don't get lost in the scroll.
+# VALIDATION
 # =============================================================================
-lead() {
-    local ip="$1"; shift
-    hot "$*"
-    echo "[LEAD] $*" >> "scans/$ip/LEADS.txt"
+
+# Check nmap installed
+if ! command -v nmap &>/dev/null; then
+    err "nmap not found — install with: apt install nmap"
+    exit 1
+fi
+
+# Validate IP (basic check)
+validate_ip() {
+    local ip="$1"
+    if [[ -z "$ip" ]]; then
+        err "No IP address provided"
+        return 1
+    fi
+    # Accept IPs and hostnames
+    if ! echo "$ip" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$|^[a-zA-Z0-9.-]+$'; then
+        err "Invalid IP/hostname format: $ip"
+        return 1
+    fi
+    return 0
+}
+
+# Check if running as root for UDP scans
+check_root_for_udp() {
+    if [[ "$EUID" -ne 0 ]]; then
+        warn "UDP scans require root/sudo — run as root or use sudo"
+        return 1
+    fi
+    return 0
 }
 
 # =============================================================================
-# SNMP hints
+# SNMP HINTS
 # =============================================================================
 snmp_hints() {
     local ip="$1"
-    lead "$ip" "SNMP UDP/161 open — often leaks users/processes/creds"
+    hot "SNMP UDP/161 found on $ip!"
     echo -e "    ${Y}[ENUM]${N} snmp-check $ip"
     echo -e "    ${Y}[ENUM]${N} onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt $ip"
     echo -e "    ${Y}[ENUM]${N} snmpwalk -v2c -c public $ip"
     echo -e "    ${Y}[ENUM]${N} snmpwalk -v2c -c private $ip"
-    echo -e "    ${Y}[ENUM]${N} snmpwalk -v1 -c public $ip"
 }
 
 # =============================================================================
-# Web checks: .git exposure, CMS detection, common files
-# =============================================================================
-web_check() {
-    local ip="$1"; local port="${2:-80}"; local proto="${3:-http}"
-    local base="$proto://$ip:$port"
-
-    log "Web checks on $base ..."
-
-    # --- Exposed .git (high value: source + creds in history) ---
-    local gitcode
-    gitcode=$($CURL -o /dev/null -w "%{http_code}" "$base/.git/HEAD")
-    if [[ "$gitcode" == "200" ]]; then
-        lead "$ip" "Exposed .git/ at $base/.git/  → dump it, creds live in history"
-        echo -e "    ${Y}→ git-dumper $base/.git/ ${ip}-git${N}"
-        echo -e "    ${Y}→ cd ${ip}-git && git log --all -p | grep -iE 'pass|key|token|secret'${N}"
-    fi
-
-    # --- Other exposed VCS / config ---
-    for f in /.svn/entries /.env /.DS_Store /config.php.bak /wp-config.php.bak /backup.zip; do
-        local c
-        c=$($CURL -o /dev/null -w "%{http_code}" "$base$f")
-        [[ "$c" == "200" ]] && lead "$ip" "Exposed file: $base$f"
-    done
-
-    # --- CMS detection ---
-    $CURL "$base/admin/login/index.php" | grep -qi "subrion" && {
-        lead "$ip" "Subrion CMS detected at $base"
-        echo -e "    ${Y}→ searchsploit subrion ; default admin:admin${N}"; }
-    $CURL "$base/wp-login.php" | grep -qi "wordpress" && {
-        lead "$ip" "WordPress detected at $base"
-        echo -e "    ${Y}→ wpscan --url $base --enumerate u,p,t${N}"; }
-    $CURL "$base/administrator/" | grep -qi "joomla" && {
-        lead "$ip" "Joomla detected at $base"
-        echo -e "    ${Y}→ joomscan -u $base ; searchsploit joomla${N}"; }
-    $CURL "$base/" | grep -qi "drupal" && {
-        lead "$ip" "Drupal detected at $base"
-        echo -e "    ${Y}→ droopescan scan drupal -u $base${N}"; }
-    $CURL "$base/phpmyadmin/" | grep -qi "phpmyadmin" && {
-        lead "$ip" "phpMyAdmin detected at $base"
-        echo -e "    ${Y}→ try root:(blank) / root:root ; searchsploit phpmyadmin${N}"; }
-    $CURL -X OPTIONS "$base/" | grep -qi "DAV:" && {
-        lead "$ip" "WebDAV enabled at $base"
-        echo -e "    ${Y}→ davtest -url $base ; cadaver $base${N}"; }
-
-    # --- Common files ---
-    for path in /robots.txt /changelog.txt /readme.txt /README.md /CHANGELOG.md /install.php /config.php /wp-config.php /.git/config; do
-        local code
-        code=$($CURL -o /dev/null -w "%{http_code}" "$base$path")
-        [[ "$code" == "200" ]] && good "Found: $base$path"
-    done
-
-    echo -e "    ${Y}→ gobuster dir -u $base -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt -x php,txt,html -t 30${N}"
-    echo -e "    ${Y}→ feroxbuster -u $base -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt -x php,txt,html${N}"
-    echo -e "    ${Y}→ nikto -h $base${N}"
-    echo -e "    ${Y}→ whatweb $base${N}"
-}
-
-# =============================================================================
-# Active Directory detection + enumeration
-# -----------------------------------------------------------------------------
-# Detection is signature-based on open ports:
-#   88(kerberos) is the near-certain DC tell; 389/636/3268/3269 = LDAP/GC.
-# Enumeration prints the full unauth + credentialed command set. The unauth
-# probes (null session, anon LDAP, AS-REP without creds) are run if nxc/tools
-# exist; credentialed commands are printed ready to paste once you have creds.
-# =============================================================================
-ad_detect_and_enum() {
-    local ip="$1"; local ports_file="$2"
-    local has88="" has389="" has445="" has53="" has3268="" has636=""
-
-    grep -qE "^88/tcp.*open"   "$ports_file" && has88=1
-    grep -qE "^389/tcp.*open"  "$ports_file" && has389=1
-    grep -qE "^3268/tcp.*open" "$ports_file" && has3268=1
-    grep -qE "^636/tcp.*open"  "$ports_file" && has636=1
-    grep -qE "^445/tcp.*open"  "$ports_file" && has445=1
-    grep -qE "^53/tcp.*open"   "$ports_file" && has53=1
-
-    # Decide role
-    local role=""
-    if [[ -n "$has88" ]]; then
-        role="DOMAIN CONTROLLER"
-    elif [[ -n "$has389" || -n "$has3268" ]] && [[ -n "$has445" ]]; then
-        role="AD-JOINED / LDAP host"
-    fi
-    [[ -z "$role" ]] && return   # not AD, skip silently
-
-    lead "$ip" "Active Directory detected → $role (88=$has88 389=$has389 3268=$has3268 636=$has636)"
-
-    # --- Try to extract domain + DC hostname from the -sCV output ---
-    local domain="" dchost=""
-    local svcfile="scans/$ip/${ip}_tcp.nmap"
-    if [[ -f "$svcfile" ]]; then
-        domain=$(grep -oiE "Domain: [A-Za-z0-9._-]+" "$svcfile" | head -1 | awk '{print $2}' | sed 's/0\.//')
-        [[ -z "$domain" ]] && domain=$(grep -oiE "DNS_Domain_Name: [A-Za-z0-9._-]+" "$svcfile" | head -1 | awk '{print $2}')
-        dchost=$(grep -oiE "DNS_Computer_Name: [A-Za-z0-9._-]+" "$svcfile" | head -1 | awk '{print $2}')
-    fi
-    [[ -n "$domain" ]] && good "Domain: $domain"
-    [[ -n "$dchost" ]] && good "DC hostname: $dchost"
-
-    # Suggest /etc/hosts so Kerberos-based tools resolve names
-    if [[ -n "$domain" || -n "$dchost" ]]; then
-        local shortname="${dchost%%.*}"   # strip any FQDN portion
-        echo -e "    ${Y}[HOSTS]${N} add to /etc/hosts:  $ip   ${dchost:-$domain} ${shortname:+$shortname.$domain $shortname} $domain"
-    fi
-
-    echo ""; hot "===== AD ENUMERATION PLAYBOOK ($ip) ====="
-    echo "----------------------------------------"
-
-    local DOM="${domain:-DOMAIN.LOCAL}"
-
-    echo -e "${W}[1] Unauthenticated — no creds needed${N}"
-    echo -e "    ${Y}→ nxc smb $ip -u '' -p '' --shares --users --pass-pol${N}"
-    echo -e "    ${Y}→ nxc smb $ip -u 'guest' -p '' --shares${N}"
-    echo -e "    ${Y}→ enum4linux-ng -A $ip${N}"
-    echo -e "    ${Y}→ ldapsearch -x -H ldap://$ip -s base namingcontexts   (anon LDAP base)${N}"
-    echo -e "    ${Y}→ ldapsearch -x -H ldap://$ip -b 'DC=${DOM//./,DC=}' '(objectClass=user)'${N}"
-    echo -e "    ${Y}→ nmap -p88 --script krb5-enum-users --script-args krb5-enum-users.realm='$DOM' $ip${N}"
-
-    echo ""; echo -e "${W}[2] User-enum → then AS-REP roast (no creds)${N}"
-    echo -e "    ${Y}→ kerbrute userenum -d $DOM --dc $ip /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt${N}"
-    echo -e "    ${Y}→ impacket-GetNPUsers $DOM/ -dc-ip $ip -no-pass -usersfile users.txt -format hashcat${N}"
-    echo -e "    ${Y}→ hashcat -m 18200 asrep.txt rockyou.txt${N}"
-
-    echo ""; echo -e "${W}[3] With ANY valid creds (replace USER/PASS)  [Impacket/nxc — run from Kali]${N}"
-    echo -e "    ${Y}→ nxc smb $ip -u USER -p PASS --shares --users --groups${N}"
-    echo -e "    ${Y}→ nxc smb $ip -u USER -p PASS --rid-brute${N}"
-    echo -e "    ${Y}→ impacket-GetUserSPNs $DOM/USER:PASS -dc-ip $ip -request -format hashcat   (Kerberoast → -m 13100)${N}"
-    echo -e "    ${Y}→ impacket-lookupsid $DOM/USER:PASS@$ip          (RID cycle → user list)${N}"
-    echo -e "    ${Y}→ nxc ldap $ip -u USER -p PASS --bloodhound --collection All --dns-server $ip${N}"
-    echo -e "    ${Y}→ bloodhound-python -u USER -p PASS -d $DOM -ns $ip -c All${N}"
-
-    echo ""; echo -e "${W}[4] Post-cred privesc / domain-takeover  [Impacket — needs creds, some need DA]${N}"
-    echo -e "    ${Y}→ nxc smb $ip -u USER -p PASS -M gpp_password -M gpp_autologin${N}"
-    echo -e "    ${Y}→ nxc smb TARGETS -u USER -p PASS --local-auth        (password reuse sweep)${N}"
-    echo -e "    ${Y}→ impacket-secretsdump $DOM/USER:PASS@$ip -just-dc-ntlm   (REQUIRES DA/replication rights)${N}"
-    echo -e "    ${Y}→ impacket-psexec $DOM/USER:PASS@$ip   /  impacket-wmiexec  (REQUIRES local admin on target)${N}"
-    echo -e "    ${Y}→ check BloodHound: 'Shortest Path to Domain Admins' + mark owned users${N}"
-
-    echo ""; echo -e "${W}[5] PowerView  [ONLY after you have a shell on a domain-JOINED Windows host]${N}"
-    echo -e "    ${C}# not run from Kali — load in your foothold session, you're already a domain user${N}"
-    echo -e "    ${Y}→ powershell -ep bypass; Import-Module .\\PowerView.ps1${N}"
-    echo -e "    ${Y}→ Get-NetDomain ; Get-NetDomainController${N}"
-    echo -e "    ${Y}→ Get-NetUser | select samaccountname,description   (descriptions often hold creds)${N}"
-    echo -e "    ${Y}→ Get-NetGroup '*admin*' ; Get-NetGroupMember 'Domain Admins'${N}"
-    echo -e "    ${Y}→ Get-NetComputer -FullData | select name,operatingsystem${N}"
-    echo -e "    ${Y}→ Find-LocalAdminAccess        (where can current user admin?)${N}"
-    echo -e "    ${Y}→ Get-NetUser -SPN | select samaccountname,serviceprincipalname  (Kerberoast targets)${N}"
-    echo -e "    ${Y}→ Find-InterestingDomainAcl -ResolveGUIDs   (ACL-based privesc paths)${N}"
-
-    echo ""; echo -e "${W}[6] Pivot reminders (internal DC behind a member box)${N}"
-    echo -e "    ${Y}→ ligolo: route_add for the internal subnet, then run the Impacket/nxc lines through the tunnel${N}"
-    echo "----------------------------------------"
-
-    # --- Live unauth probes (only if tools present; these touch the target) ---
-    if command -v nxc >/dev/null 2>&1; then
-        log "Running live unauth SMB probe (null session)..."
-        nxc smb "$ip" -u '' -p '' --shares 2>/dev/null | tee -a "scans/$ip/ad_nullsession.txt" | grep -qiE 'READ|WRITE' \
-            && lead "$ip" "SMB null session readable — see scans/$ip/ad_nullsession.txt"
-        nxc smb "$ip" -u '' -p '' --users 2>/dev/null > "scans/$ip/ad_users_null.txt"
-        [[ -s "scans/$ip/ad_users_null.txt" ]] && grep -qiE '\\\\' "scans/$ip/ad_users_null.txt" \
-            && lead "$ip" "Domain users enumerable via null session — scans/$ip/ad_users_null.txt"
-    else
-        warn "nxc (netexec) not installed — skipping live AD probes, commands above still valid"
-    fi
-}
-
-# =============================================================================
-# Service hints
+# SERVICE HINTS
 # =============================================================================
 service_hints() {
-    local ip="$1"; local ports_file="$2"; local proto="$3"
-    echo ""; log "Next steps for $ip ($proto):"
+    local ip="$1"
+    local ports_file="$2"
+    local proto="$3"
+
+    if [[ ! -f "$ports_file" ]]; then
+        warn "Port file not found: $ports_file — skipping hints"
+        return
+    fi
+
+    echo ""
+    log "Next steps for $ip ($proto):"
     echo "----------------------------------------"
 
     while IFS= read -r line; do
         port=$(echo "$line" | awk '{print $1}' | cut -d'/' -f1)
         case "$port" in
-            21)
-                good "FTP → anonymous + version exploits"
-                echo -e "    ${Y}→ ftp $ip   (anonymous / blank)${N}"
-                echo -e "    ${Y}→ nmap -p21 --script ftp-anon,ftp-syst $ip${N}"
-                echo -e "    ${Y}→ hydra -l admin -P rockyou.txt ftp://$ip${N}"
-                echo -e "    ${Y}→ searchsploit vsftpd / proftpd${N}" ;;
-            22)
-                good "SSH → known creds / key auth"
-                echo -e "    ${Y}→ hydra -L users.txt -P rockyou.txt ssh://$ip -t 4${N}"
-                echo -e "    ${Y}→ if key: ssh2john id_rsa > h ; john h --wordlist=rockyou.txt${N}" ;;
-            23) good "Telnet → telnet $ip" ;;
+            21)   good "FTP → ftp $ip (try: anonymous / blank)"
+                  echo -e "    ${Y}→ lftp -u anonymous, ftp://$ip${N}"
+                  echo -e "    ${Y}→ hydra -l admin -P /usr/share/wordlists/rockyou.txt ftp://$ip${N}" ;;
+            22)   good "SSH → ssh user@$ip"
+                  echo -e "    ${Y}→ ssh-audit $ip${N}"
+                  echo -e "    ${Y}→ hydra -l user -P /usr/share/wordlists/rockyou.txt ssh://$ip${N}" ;;
+            23)   good "Telnet → nc $ip 23" ;;
             25|587|2525)
-                good "SMTP ($port) → user enum"
-                echo -e "    ${Y}→ smtp-user-enum -M VRFY -U /usr/share/seclists/Usernames/top-usernames-shortlist.txt -t $ip${N}"
-                echo -e "    ${Y}→ searchsploit exim / postfix / sendmail${N}" ;;
-            53)
-                good "DNS → zone transfer"
-                echo -e "    ${Y}→ dig axfr DOMAIN @$ip${N}"
-                echo -e "    ${Y}→ dnsrecon -d DOMAIN -t axfr -n $ip${N}" ;;
-            79)
-                good "Finger → user enum"
-                echo -e "    ${Y}→ for u in root admin guest; do finger \$u@$ip; done${N}" ;;
+                  good "SMTP ($port) → smtp-user-enum -M VRFY -U users.txt -t $ip"
+                  echo -e "    ${Y}→ nxc smtp $ip -u users.txt -p passwords.txt${N}"
+                  echo -e "    ${Y}→ searchsploit exim / postfix / sendmail${N}" ;;
+            53)   good "DNS → dig axfr DOMAIN @$ip"
+                  echo -e "    ${Y}→ dnsrecon -d DOMAIN -t axfr -n $ip${N}"
+                  echo -e "    ${Y}→ gobuster dns -d DOMAIN -r $ip -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt${N}" ;;
             80|8080|8000|8888)
-                good "HTTP ($port) → web enum"
-                web_check "$ip" "$port" "http" ;;
+                  good "HTTP ($port) → feroxbuster -u http://$ip:$port -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+                  echo -e "    ${Y}→ gobuster dir -u http://$ip:$port -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt -x php,txt,html${N}"
+                  echo -e "    ${Y}→ nikto -h http://$ip:$port${N}"
+                  echo -e "    ${Y}→ whatweb http://$ip:$port${N}" ;;
             443|8443)
-                good "HTTPS ($port) → web enum"
-                echo -e "    ${Y}→ openssl s_client -connect $ip:$port  (cert hostnames)${N}"
-                web_check "$ip" "$port" "https" ;;
-            110) good "POP3 → telnet $ip 110 ; hydra pop3://$ip" ;;
-            143) good "IMAP → telnet $ip 143 ; hydra imap://$ip" ;;
+                  good "HTTPS ($port) → feroxbuster -u https://$ip:$port -k -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+                  echo -e "    ${Y}→ gobuster dir -u https://$ip:$port -k -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt${N}"
+                  echo -e "    ${Y}→ nikto -h https://$ip:$port -ssl${N}" ;;
+            88)   good "Kerberos → impacket-GetNPUsers DOMAIN/ -usersfile users.txt -no-pass -dc-ip $ip"
+                  echo -e "    ${Y}→ impacket-GetUserSPNs DOMAIN/user:pass -dc-ip $ip -request${N}"
+                  echo -e "    ${Y}→ nxc ldap $ip -u '' -p '' --asreproast asrep.txt${N}" ;;
+            110)  good "POP3 → telnet $ip 110"
+                  echo -e "    ${Y}→ USER root PASS password${N}" ;;
+            111)  good "RPC/NFS → rpcinfo -p $ip"
+                  echo -e "    ${Y}→ showmount -e $ip${N}"
+                  echo -e "    ${Y}→ mount -t nfs $ip:/ /mnt/${N}" ;;
             139|445)
-                good "SMB → enumeration"
-                echo -e "    ${Y}→ nxc smb $ip -u '' -p '' --shares${N}"
-                echo -e "    ${Y}→ nxc smb $ip -u 'guest' -p '' --shares${N}"
-                echo -e "    ${Y}→ enum4linux-ng $ip${N}"
-                echo -e "    ${Y}→ smbclient -L //$ip/ -N${N}"
-                echo -e "    ${Y}→ nxc smb $ip -u '' -p '' --users --pass-pol${N}"
-                echo -e "    ${Y}→ nmap -p445 --script smb-vuln* $ip  (EternalBlue etc)${N}"
-                # quick null-session probe → lead
-                if command -v nxc >/dev/null 2>&1; then
-                    nxc smb "$ip" -u '' -p '' --shares 2>/dev/null | grep -qiE 'READ|WRITE' \
-                        && lead "$ip" "SMB null/guest session yields readable shares"
-                fi ;;
-            1433)
-                good "MSSQL → default creds"
-                echo -e "    ${Y}→ nxc mssql $ip -u sa -p '' ; impacket-mssqlclient sa@$ip${N}" ;;
-            3306)
-                good "MySQL → default creds"
-                echo -e "    ${Y}→ mysql -u root -h $ip --password=''${N}"
-                echo -e "    ${Y}→ nmap -p3306 --script mysql-empty-password,mysql-info $ip${N}" ;;
-            3389)
-                good "RDP → creds / NLA check"
-                echo -e "    ${Y}→ xfreerdp /u:administrator /p:password /v:$ip${N}"
-                echo -e "    ${Y}→ nxc rdp $ip -u users.txt -p passwords.txt${N}" ;;
-            5432) good "PostgreSQL → psql -h $ip -U postgres" ;;
-            5985|5986)
-                good "WinRM → evil-winrm"
-                echo -e "    ${Y}→ evil-winrm -i $ip -u administrator -p password${N}"
-                echo -e "    ${Y}→ evil-winrm -i $ip -u administrator -H NTLMHASH${N}" ;;
-            6379) good "Redis → redis-cli -h $ip ; KEYS '*'" ;;
-            2049) good "NFS → showmount -e $ip ; mount -t nfs $ip:/ /mnt/ -o nolock" ;;
-            111)  good "RPC → rpcinfo -p $ip ; showmount -e $ip" ;;
+                  good "SMB → nxc smb $ip -u '' -p '' --shares"
+                  echo -e "    ${Y}→ enum4linux-ng $ip${N}"
+                  echo -e "    ${Y}→ smbclient -L //$ip/${N}"
+                  echo -e "    ${Y}→ nxc smb $ip -u '' -p '' --users --pass-pol${N}" ;;
+            143)  good "IMAP → telnet $ip 143" ;;
+            389|636|3268|3269)
+                  good "LDAP ($port) → ldapsearch -x -H ldap://$ip -b 'DC=domain,DC=com'"
+                  echo -e "    ${Y}→ nxc ldap $ip -u '' -p '' --users${N}"
+                  echo -e "    ${Y}→ windapsearch.py -d DOMAIN --dc-ip $ip -U${N}" ;;
+            1433) good "MSSQL → nxc mssql $ip -u sa -p ''"
+                  echo -e "    ${Y}→ impacket-mssqlclient sa@$ip${N}"
+                  echo -e "    ${Y}→ sqsh -S $ip -U sa -P ''${N}" ;;
+            2049) good "NFS → showmount -e $ip"
+                  echo -e "    ${Y}→ mount -t nfs $ip:/ /mnt/${N}"
+                  echo -e "    ${Y}→ nmap --script nfs-ls,nfs-showmount $ip${N}" ;;
+            3306) good "MySQL → mysql -u root -h $ip"
+                  echo -e "    ${Y}→ mysql -u root -h $ip --password=''${N}"
+                  echo -e "    ${Y}→ nxc mysql $ip -u root -p ''${N}" ;;
+            3389) good "RDP → xfreerdp /u:administrator /p:password /v:$ip"
+                  echo -e "    ${Y}→ nxc rdp $ip -u users.txt -p passwords.txt${N}"
+                  echo -e "    ${Y}→ rdesktop $ip${N}" ;;
+            5432) good "PostgreSQL → psql -h $ip -U postgres"
+                  echo -e "    ${Y}→ nxc postgres $ip -u postgres -p ''${N}" ;;
+            5985|5986|47001)
+                  good "WinRM ($port) → evil-winrm -i $ip -u administrator -p password"
+                  echo -e "    ${Y}→ nxc winrm $ip -u users.txt -p passwords.txt${N}" ;;
+            6379) good "Redis → redis-cli -h $ip"
+                  echo -e "    ${Y}→ redis-cli -h $ip KEYS '*'${N}"
+                  echo -e "    ${Y}→ redis-cli -h $ip CONFIG GET requirepass${N}" ;;
+            9200|9300)
+                  good "Elasticsearch ($port) → curl http://$ip:$port"
+                  echo -e "    ${Y}→ curl http://$ip:$port/_cat/indices${N}" ;;
+            27017|27018)
+                  good "MongoDB ($port) → mongosh $ip"
+                  echo -e "    ${Y}→ mongo $ip --eval 'db.adminCommand({listDatabases:1})'${N}" ;;
+            # UDP specific
+            69)   good "TFTP (UDP) → tftp $ip"
+                  echo -e "    ${Y}→ try: get /etc/passwd${N}" ;;
             161)  snmp_hints "$ip" ;;
-            69)   good "TFTP (UDP) → tftp $ip ; get /etc/passwd" ;;
-            500)  good "IKE/IPSec → ike-scan -M $ip" ;;
-            27017|27018) good "MongoDB → mongosh $ip --eval 'show dbs'" ;;
-            8009) good "AJP → searchsploit ghostcat (CVE-2020-1938)" ;;
+            500)  good "IKE/IPSec → ike-scan $ip" ;;
         esac
     done < <(grep "^[0-9]" "$ports_file" 2>/dev/null | grep "open")
 
@@ -374,123 +235,229 @@ service_hints() {
 }
 
 # =============================================================================
-# TCP scan
+# TCP SCAN
 # =============================================================================
 do_tcp_scan() {
     local ip="$1"
+    local outdir="scans/$ip"
+
     log "TCP Stage 1/2: Full port scan..."
-    nmap -Pn $SPEED -p- "$ip" --open -oN "scans/$ip/${ip}_tcp_ports.txt" 2>/dev/null
 
-    ports=$(grep "^[0-9]" "scans/$ip/${ip}_tcp_ports.txt" 2>/dev/null | grep "open" | \
-            awk '{split($1,a,"/"); printf "%s,",a[1]}' | sed 's/,$//')
+    # FIX: added --defeat-rst-ratelimit via $SPEED to catch ports on slow/filtered hosts
+    if ! nmap -Pn $SPEED -p- "$ip" \
+        --open \
+        -oN "$outdir/${ip}_tcp_ports.txt" 2>/dev/null; then
+        err "TCP port scan failed for $ip — check connectivity"
+        return 1
+    fi
 
-    if [[ -z "$ports" ]]; then warn "No open TCP ports on $ip"; return; fi
+    # Extract open ports
+    ports=$(grep "^[0-9]" "$outdir/${ip}_tcp_ports.txt" 2>/dev/null | \
+            grep "open" | \
+            awk '{split($1,a,"/"); printf "%s,",a[1]}' | \
+            sed 's/,$//')
+
+    if [[ -z "$ports" ]]; then
+        warn "No open TCP ports on $ip"
+        warn "Try: $0 $ip --udp  OR  $0 $ip T4  OR check if host is up"
+        return 0
+    fi
+
     good "Open TCP ports: $ports"
 
     log "TCP Stage 2/2: Service scan on open ports..."
-    nmap -Pn $SPEED -sC -sV -p "$ports" "$ip" -oA "scans/$ip/${ip}_tcp" 2>/dev/null
+    if ! nmap -Pn $SPEED -sC -sV -p "$ports" "$ip" \
+        -oA "$outdir/${ip}_tcp" 2>/dev/null; then
+        warn "Service scan failed — port list may be stale, retry"
+    fi
 
-    service_hints "$ip" "scans/$ip/${ip}_tcp_ports.txt" "tcp"
+    service_hints "$ip" "$outdir/${ip}_tcp_ports.txt" "tcp"
 
-    # AD detection runs after -sCV so it can mine the domain/DC name from output
-    ad_detect_and_enum "$ip" "scans/$ip/${ip}_tcp_ports.txt"
-
-    echo "TCP=$ports" >> "scans/$ip/results.txt"
+    echo "TCP=$ports" >> "$outdir/results.txt"
 }
 
 # =============================================================================
-# UDP scan
+# UDP SCAN
 # =============================================================================
 do_udp_scan() {
     local ip="$1"
+    local outdir="scans/$ip"
+
+    # UDP needs root
+    if ! check_root_for_udp; then
+        warn "Skipping UDP scan — re-run as root"
+        return 1
+    fi
+
     log "UDP Stage 1/2: Top-100 port scan (requires sudo)..."
-    sudo nmap -Pn $SPEED -sU --top-ports 100 "$ip" --open \
-        -oN "scans/$ip/${ip}_udp_ports.txt" 2>/dev/null
 
-    # FIX: need grep -E for the alternation to work
-    udp_ports=$(grep "^[0-9]" "scans/$ip/${ip}_udp_ports.txt" 2>/dev/null | \
-                grep -vE "open\|filtered" | grep "open" | \
-                awk '{split($1,a,"/"); printf "%s,",a[1]}' | sed 's/,$//')
+    if ! nmap -Pn $SPEED -sU --top-ports 100 "$ip" \
+        --open \
+        -oN "$outdir/${ip}_udp_ports.txt" 2>/dev/null; then
+        err "UDP scan failed for $ip"
+        return 1
+    fi
 
-    if [[ -z "$udp_ports" ]]; then warn "No open UDP ports on $ip"; return; fi
+    # FIX: UDP shows "open|filtered" — include those, not just "open"
+    # Previous version was accidentally excluding valid UDP ports
+    udp_ports=$(grep "^[0-9]" "$outdir/${ip}_udp_ports.txt" 2>/dev/null | \
+                grep -E "open[^|]|open\|filtered" | \
+                awk '{split($1,a,"/"); printf "%s,",a[1]}' | \
+                sed 's/,$//')
+
+    if [[ -z "$udp_ports" ]]; then
+        warn "No open UDP ports on $ip"
+        return 0
+    fi
+
     good "Open UDP ports: $udp_ports"
 
-    echo "$udp_ports" | grep -q "161" && snmp_hints "$ip"
+    # SNMP special handling
+    if echo "$udp_ports" | grep -q "\b161\b"; then
+        snmp_hints "$ip"
+    fi
 
     log "UDP Stage 2/2: Service scan on open ports..."
-    sudo nmap -Pn $SPEED -sC -sV -sU -p "$udp_ports" "$ip" -oA "scans/$ip/${ip}_udp" 2>/dev/null
+    if ! nmap -Pn $SPEED -sC -sV -sU -p "$udp_ports" "$ip" \
+        -oA "$outdir/${ip}_udp" 2>/dev/null; then
+        warn "UDP service scan had issues — check output file"
+    fi
 
-    service_hints "$ip" "scans/$ip/${ip}_udp_ports.txt" "udp"
-    echo "UDP=$udp_ports" >> "scans/$ip/results.txt"
+    service_hints "$ip" "$outdir/${ip}_udp_ports.txt" "udp"
+
+    echo "UDP=$udp_ports" >> "$outdir/results.txt"
 }
 
 # =============================================================================
-# Main per-host
+# MAIN SCAN FUNCTION
 # =============================================================================
 scan_host() {
     local ip="$1"
-    mkdir -p "scans/$ip"
-    > "scans/$ip/results.txt"
-    > "scans/$ip/LEADS.txt"
 
-    echo ""; echo -e "${C}============================================${N}"
-    log "Target: $ip | Mode: $SCAN_MODE | Timing: ${TIMING:-normal}"
+    # Validate IP
+    if ! validate_ip "$ip"; then
+        return 1
+    fi
+
+    local outdir="scans/$ip"
+    mkdir -p "$outdir" || {
+        err "Cannot create output dir: $outdir"
+        return 1
+    }
+    > "$outdir/results.txt"
+
+    echo ""
+    echo -e "${C}============================================${N}"
+    log "Target: $ip | Mode: $SCAN_MODE | Timing: ${TIMING}"
     echo -e "${C}============================================${N}"
 
     case "$SCAN_MODE" in
-        tcp) do_tcp_scan "$ip" ;;
-        udp) do_udp_scan "$ip" ;;
-        all) do_tcp_scan "$ip"; echo ""; do_udp_scan "$ip" ;;
+        tcp)
+            do_tcp_scan "$ip"
+            ;;
+        udp)
+            do_udp_scan "$ip"
+            ;;
+        all)
+            do_tcp_scan "$ip"
+            echo ""
+            do_udp_scan "$ip"
+            ;;
+        *)
+            err "Unknown scan mode: $SCAN_MODE (use tcp, udp, or all)"
+            return 1
+            ;;
     esac
 
-    echo ""; echo -e "${C}============================================${N}"
+    # Final summary
+    echo ""
+    echo -e "${C}============================================${N}"
     good "SCAN COMPLETE: $ip"
-    cat "scans/$ip/results.txt" 2>/dev/null | while read -r l; do good "$l"; done
-
-    # Surface priority leads at the very end so they're impossible to miss
-    if [[ -s "scans/$ip/LEADS.txt" ]]; then
-        echo ""; hot "PRIORITY LEADS for $ip:"
-        sed 's/^/    /' "scans/$ip/LEADS.txt"
+    if [[ -f "$outdir/results.txt" ]] && [[ -s "$outdir/results.txt" ]]; then
+        while IFS= read -r line; do
+            good "$line"
+        done < "$outdir/results.txt"
+    else
+        warn "No results recorded for $ip"
     fi
     echo -e "${C}============================================${N}"
 
+    # Save SUMMARY.md
     {
         echo "# Scan Summary: $ip"
         echo "Date: $(date)"
-        echo "Mode: $SCAN_MODE"
+        echo "Mode: $SCAN_MODE | Timing: $TIMING"
         echo ""
-        [[ -s "scans/$ip/LEADS.txt" ]] && { echo "## Priority Leads"; sed 's/^/- /' "scans/$ip/LEADS.txt"; echo ""; }
-        [[ -f "scans/$ip/${ip}_tcp_ports.txt" ]] && {
-            echo "## TCP Ports"; echo '```'
-            grep "^[0-9]" "scans/$ip/${ip}_tcp_ports.txt" 2>/dev/null | grep "open"; echo '```'; }
-        [[ -f "scans/$ip/${ip}_udp_ports.txt" ]] && {
-            echo ""; echo "## UDP Ports"; echo '```'
-            grep "^[0-9]" "scans/$ip/${ip}_udp_ports.txt" 2>/dev/null | grep "open"; echo '```'; }
-    } > "scans/$ip/SUMMARY.md"
+        if [[ -f "$outdir/${ip}_tcp_ports.txt" ]]; then
+            echo "## TCP Ports"
+            echo '```'
+            grep "^[0-9]" "$outdir/${ip}_tcp_ports.txt" 2>/dev/null | grep "open" || echo "none"
+            echo '```'
+        fi
+        if [[ -f "$outdir/${ip}_udp_ports.txt" ]]; then
+            echo ""
+            echo "## UDP Ports"
+            echo '```'
+            grep "^[0-9]" "$outdir/${ip}_udp_ports.txt" 2>/dev/null | grep "open" || echo "none"
+            echo '```'
+        fi
+        if [[ -f "$outdir/results.txt" ]]; then
+            echo ""
+            echo "## Results"
+            cat "$outdir/results.txt"
+        fi
+    } > "$outdir/SUMMARY.md" 2>/dev/null
 
-    good "Saved: scans/$ip/SUMMARY.md"
+    good "Saved: $outdir/SUMMARY.md"
 }
 
-export -f scan_host do_tcp_scan do_udp_scan snmp_hints service_hints web_check lead ad_detect_and_enum
-export -f log good warn hot
-export SPEED SCAN_MODE CURL R G Y C W N
+# Export for parallel
+export -f scan_host do_tcp_scan do_udp_scan snmp_hints service_hints
+export -f log good warn hot err validate_ip check_root_for_udp
+export SPEED SCAN_MODE TIMING R G Y C W N
 
 # =============================================================================
-# Execute
+# EXECUTE
 # =============================================================================
-check_deps
-
 if [[ "$MODE" == "file" ]]; then
-    if [[ -z "$FILE" || ! -f "$FILE" ]]; then warn "Invalid or missing file: $FILE"; print_help; fi
+    # Validate file
+    if [[ -z "$FILE" ]]; then
+        err "No file specified after -f"
+        print_help
+    fi
+    if [[ ! -f "$FILE" ]]; then
+        err "File not found: $FILE"
+        exit 1
+    fi
+    if [[ ! -s "$FILE" ]]; then
+        err "File is empty: $FILE"
+        exit 1
+    fi
+
     log "Scanning from file: $FILE (mode: $SCAN_MODE)"
-    if command -v parallel >/dev/null 2>&1; then
+    TARGET_COUNT=$(wc -l < "$FILE")
+    log "Total targets: $TARGET_COUNT"
+
+    # FIX: proper parallel fallback — serial mode if parallel not installed
+    if command -v parallel &>/dev/null; then
+        log "Using GNU parallel (5 concurrent)"
         cat "$FILE" | parallel -j 5 scan_host
     else
-        while read -r line; do [[ -n "$line" ]] && scan_host "$line"; done < "$FILE"
+        warn "GNU parallel not found — running serial (install with: apt install parallel)"
+        while IFS= read -r ip; do
+            [[ -z "$ip" || "$ip" == \#* ]] && continue  # skip blank/comment lines
+            scan_host "$ip"
+        done < "$FILE"
     fi
+
 elif [[ "$MODE" == "single" ]]; then
-    [[ -z "$IP" ]] && print_help
+    if [[ -z "$IP" ]]; then
+        err "No IP address provided"
+        print_help
+    fi
     scan_host "$IP"
+
 else
+    err "Unknown mode: $MODE"
     print_help
 fi
